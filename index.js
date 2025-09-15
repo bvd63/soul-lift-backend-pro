@@ -1,6 +1,6 @@
-// SoulLift backend — Fastify v4 (ESM). Fără dependențe fragile.
-// CORS, Helmet, RateLimit, Compress, Swagger, Prometheus metrics,
-// Translator: OpenAI -> DeepL fallback, BullMQ/Redis (opțional).
+// SoulLift backend — Fastify v4 (ESM)
+// Features: CORS, Helmet, RateLimit, Compress, Swagger, Prometheus metrics,
+// OpenAI -> DeepL fallback, BullMQ/Redis (optional)
 
 import Fastify from "fastify";
 import cors from "@fastify/cors";
@@ -80,7 +80,7 @@ if (USE_QUEUE && REDIS_URL) {
     "translate",
     async (job) => {
       app.log.info({ jobId: job.id }, "Worker running");
-      // placeholder
+      // Placeholder
       return { ok: true, data: job.data };
     },
     { connection }
@@ -156,7 +156,7 @@ async function translateText(text, targetLang = "EN") {
   } catch (e) {
     app.log.warn({ err: String(e).slice(0, 200) }, "DeepL failed");
   }
-  return text; // final fallback
+  return text; // fallback final
 }
 
 // -------- routes
