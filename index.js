@@ -1,8 +1,8 @@
 // --- Core & setup ---
 const fastify = require('fastify')({
   logger: true,
-  bodyLimit: 32 * 1024,       // 32KB payloads
-  connectionTimeout: 10_000   // basic safety
+  bodyLimit: 32 * 1024,
+  connectionTimeout: 10_000
 });
 const cors = require('@fastify/cors');
 const helmet = require('@fastify/helmet');
@@ -19,11 +19,12 @@ const IORedis = require('ioredis');
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_ENDPOINT = process.env.OPENAI_ENDPOINT || 'https://api.openai.com';
 const USE_OPENAI  = String(process.env.USE_OPENAI || '').toLowerCase() === 'true';
-const USE_QUEUE   = String(process.env.USE_QUEUE || '').toLowerCase() === 'true';
+const USE_QUEUE   = String(process.env.USE_QUEUE  || '').toLowerCase() === 'true';
 const REDIS_URL   = process.env.REDIS_URL || '';
 const RATE_MAX    = Number(process.env.RATE_MAX || 100);
 const RATE_WINDOW = process.env.RATE_WINDOW || '1 minute';
-const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS || '*').split(',').map(s => s.trim()).filter(Boolean);
+const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS || '*')
+  .split(',').map(s => s.trim()).filter(Boolean);
 const SENTRY_DSN  = process.env.SENTRY_DSN || '';
 
 // ---- Sentry (monitorizare erori) ----
@@ -37,7 +38,7 @@ if (SENTRY_DSN) {
   });
 }
 
-// ---- Limbi suportate (RO, EN + top 10 + IT) ----
+// ---- Limbi suportate ----
 const SUPPORTED_LANGS = [
   { code: 'ro', name: 'Romanian' },
   { code: 'en', name: 'English' },
@@ -54,7 +55,7 @@ const SUPPORTED_LANGS = [
   { code: 'it', name: 'Italian' }
 ];
 
-// ---- Local seed quotes (sursa pentru fallback & traduceri) ----
+// ---- Local seed quotes (fallback & traduceri) ----
 const localQuotes = [
   { id: 1, text: 'Succesul nu este final, eșecul nu este fatal: curajul de a continua contează.', author: 'W. Churchill', lang: 'ro' },
   { id: 2, text: 'Nu judeca fiecare zi după recolta pe care o culegi, ci după semințele pe care le plantezi.', author: 'R. L. Stevenson', lang: 'ro' },
@@ -68,14 +69,16 @@ function pickLocal(lang) {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
+async function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
 async function withBackoff(op, tries = 3, base = 200) {
   let last;
   for (let i = 0; i < tries; i++) {
     try { return await op(); }
     catch (e) {
       last = e;
-      if ((e?.status || 0) !== 429) break;
-      await new Promise(r => setTimeout(r, base * Math.pow(2, i)));
+      if ((e?.status || 0) !== 429) break; // doar pe 429 are sens backoff
+      await sleep(base * Math.pow(2, i));
     }
   }
   throw last;
@@ -141,14 +144,19 @@ async function translateQuote({ text, author, targetLang }) {
 // ---- Queue opțională (BullMQ) pentru traduceri async ----
 let translateQueue = null;
 if (USE_QUEUE && REDIS_URL) {
-  const redis = new IORedis(REDIS_URL);
-  translateQueue = new Queue('translations', { connection: redis });
+  try {
+    const redis = new IORedis(REDIS_URL);
+    translateQueue = new Queue('translations', { connection: redis });
 
-  // Worker în același proces (simplu). Pentru producție mare → separă în alt proces.
-  new Worker('translations', async job => {
-    const { text, author, targetLang } = job.data;
-    return await translateQuote({ text, author, targetLang });
-  }, { connection: redis });
+    // Worker în același proces (ok pentru simplu). Pentru producție mare → separă.
+    new Worker('translations', async job => {
+      const { text, author, targetLang } = job.data;
+      return await translateQuote({ text, author, targetLang });
+    }, { connection: redis });
+  } catch (e) {
+    fastify.log.error(e, 'Redis/BullMQ init failed; queue disabled');
+    translateQueue = null;
+  }
 }
 
 // --- App bootstrap ---
@@ -170,7 +178,7 @@ async function build() {
   });
   await fastify.register(swaggerUI, { routePrefix: '/docs', uiConfig: { docExpansion: 'list' } });
 
-  // Health & readiness
+  // --- Health & readiness checks ---
   fastify.get('/health', async () => ({ ok: true }));
   fastify.get('/ready', async () => ({
     deps: {
@@ -179,18 +187,13 @@ async function build() {
     }
   }));
 
-  // Lista limbilor (pt. UI)
+  // --- Info & limbi ---
+  fastify.get('/main', async () => ({ ok: true, backend: USE_OPENAI && OPENAI_API_KEY ? 'openai' : 'local' }));
   fastify.get('/langs', async () => SUPPORTED_LANGS);
 
-  // Random local (fallback)
+  // --- Random local (fallback) ---
   fastify.get('/quotes/random', {
-    schema: {
-      querystring: {
-        type: 'object',
-        properties: { lang: { type: 'string' } },
-        additionalProperties: false
-      }
-    }
+    schema: { querystring: { type: 'object', properties: { lang: { type: 'string' } }, additionalProperties: false } }
   }, async (request, reply) => {
     const { lang } = request.query || {};
     const q = pickLocal(lang);
@@ -198,43 +201,41 @@ async function build() {
     return q;
   });
 
-  // Citat AI/Tradus pentru orice limbă suportată
+  // --- Citat AI/Tradus pentru orice limbă suportată ---
   fastify.get('/v1/quote', {
     schema: {
       querystring: {
         type: 'object',
-        properties: {
-          lang: { type: 'string' },
-          category: { type: 'string' }
-        },
+        properties: { lang: { type: 'string' }, category: { type: 'string' } },
         additionalProperties: false
       }
     }
   }, async (request, reply) => {
-    // Auto-detect dacă nu se trimite ?lang= (din Accept-Language)
+    // Auto-detect dacă lipsește ?lang= (din Accept-Language)
     const rawPref = request.headers['accept-language']?.split(',')[0]?.slice(0,2);
     const { lang = rawPref || 'en', category = 'motivation' } = request.query || {};
 
     const isSupported = SUPPORTED_LANGS.some(l => l.code === lang);
-    if (!isSupported) {
-      return reply.code(400).send({ error: `Unsupported lang '${lang}'.` });
-    }
+    if (!isSupported) return reply.code(400).send({ error: `Unsupported lang '${lang}'.` });
 
     // Bază pentru traducere = un citat ENG local
     const base = pickLocal('en');
 
-    // Dacă ai coadă → procesezi async (dacă vrei să scalezi)
+    // Coada (dacă e activă) — procesare prin Redis
     if (translateQueue && USE_QUEUE) {
       const job = await translateQueue.add('translate', { text: base.text, author: base.author, targetLang: lang });
-      const res = await job.waitUntilFinished(); // simplu, dar tot sync pentru demo
+      const res = await job.waitUntilFinished(); // simplu (sync) pentru demo
       reply.header('X-Source', USE_OPENAI ? 'ai-translate-queue' : 'local-fallback');
       return { id: Date.now(), text: res.text, author: res.author, lang: res.lang, category };
     }
 
     // Direct (sync)
-    if (lang === 'en' || lang === 'ro') {
-      // livrăm base direct sau traducem în ro
-      const out = (lang === 'en') ? base : await translateQuote({ text: base.text, author: base.author, targetLang: 'ro' });
+    if (lang === 'en') {
+      reply.header('X-Source', 'local');
+      return { id: Date.now(), text: base.text, author: base.author, lang, category };
+    }
+    if (lang === 'ro') {
+      const out = await translateQuote({ text: base.text, author: base.author, targetLang: 'ro' });
       reply.header('X-Source', USE_OPENAI ? 'local/ai' : 'local');
       return { id: Date.now(), text: out.text, author: out.author, lang, category };
     }
@@ -244,7 +245,7 @@ async function build() {
     return { id: Date.now(), text: translated.text, author: translated.author, lang: translated.lang, category };
   });
 
-  // AI fixer endpoint: trimite eroarea și primești pași de remediere
+  // --- AI fixer endpoint: trimite eroarea și primești pași de remediere ---
   fastify.post('/ai/fix', {
     schema: {
       body: {
@@ -339,7 +340,6 @@ ${shortCtx}
 
   // Start server
   try {
-    await fastify.register(swagger); // ensure schema is collected before listen
     await fastify.listen({ port: process.env.PORT || 3000, host: '0.0.0.0' });
     fastify.log.info('Docs at /docs, Metrics at /metrics');
   } catch (err) {
