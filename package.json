@@ -16,7 +16,7 @@
     "@fastify/cors": "8.3.0",
     "@fastify/helmet": "9.1.0",
     "@fastify/rate-limit": "7.6.0",
-    "@fastify/compress": "8.1.0",
+    "@fastify/compress": "7.0.2",
     "@fastify/swagger": "8.14.0",
     "@fastify/swagger-ui": "4.0.0",
     "fastify-metrics": "10.3.0",
