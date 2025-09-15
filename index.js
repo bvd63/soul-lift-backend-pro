@@ -72,7 +72,9 @@ await app.register(metrics, {
 // -------- queue (optional)
 let translateQueue;
 if (USE_QUEUE && REDIS_URL) {
-  const connection = new IORedis(REDIS_URL);
+  const connection = new IORedis(REDIS_URL, {
+  maxRetriesPerRequest: null
+});
   translateQueue = new Queue("translate", { connection });
   const queueEvents = new QueueEvents("translate", { connection });
 
