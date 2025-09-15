@@ -1,6 +1,6 @@
-// SoulLift backend (Fastify v4, ESM)
-// Features: CORS, Helmet, RateLimit, Compress, Swagger, Prometheus metrics,
-// OpenAI → DeepL translation fallback, optional BullMQ + Redis queue.
+// SoulLift backend — Fastify v4 (ESM). Fără dependențe fragile.
+// CORS, Helmet, RateLimit, Compress, Swagger, Prometheus metrics,
+// Translator: OpenAI -> DeepL fallback, BullMQ/Redis (opțional).
 
 import Fastify from "fastify";
 import cors from "@fastify/cors";
@@ -13,47 +13,34 @@ import metrics from "fastify-metrics";
 import { Queue, Worker, QueueEvents } from "bullmq";
 import IORedis from "ioredis";
 
-// -------------------- helpers --------------------
+// -------- utils
 const isProd = process.env.NODE_ENV === "production";
-
-const logger =
-  isProd
-    ? { level: "info" }
-    : {
-        level: "debug",
-        transport: { target: "pino-pretty", options: { translateTime: "SYS:standard" } }
-      };
-
-const app = Fastify({ logger });
+const app = Fastify({ logger: { level: isProd ? "info" : "debug" } });
 
 const bool = (v, def = false) => {
-  if (v === undefined) return def;
+  if (v === undefined || v === null) return def;
   return ["1", "true", "yes", "on"].includes(String(v).toLowerCase());
 };
-
 const num = (v, def) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 };
-
-const asCsv = (v) =>
+const csv = (v) =>
   String(v || "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
 
-// -------------------- env --------------------
+// -------- env
 const PORT = num(process.env.PORT, 3000);
 
-const ALLOW_ORIGINS =
-  asCsv(process.env.ALLOW_ORIGINS || process.env.ORIGIN);
-const RATE_MAX = num(process.env.RATE_MAX, 120); // req / window
-const RATE_WINDOW = num(process.env.RATE_WINDOW, 60_000); // ms
+const ALLOW_ORIGINS = csv(process.env.ALLOW_ORIGINS || process.env.ORIGIN);
+const RATE_MAX = num(process.env.RATE_MAX, 120);
+const RATE_WINDOW = num(process.env.RATE_WINDOW, 60_000);
 
 const USE_OPENAI = bool(process.env.USE_OPENAI, true);
 const OPENAI_PRIMARY = process.env.OPENAI_API_KEY || "";
-const OPENAI_POOL = asCsv(process.env.API_KEYS);
-const OPENAI_KEYS = [OPENAI_PRIMARY, ...OPENAI_POOL].filter(Boolean);
+const OPENAI_KEYS = [OPENAI_PRIMARY, ...csv(process.env.API_KEYS)].filter(Boolean);
 
 const DEEPL_API_KEY = process.env.DEEPL_API_KEY || "";
 const DEEPL_ENDPOINT = process.env.DEEPL_ENDPOINT || "https://api-free.deepl.com";
@@ -61,31 +48,20 @@ const DEEPL_ENDPOINT = process.env.DEEPL_ENDPOINT || "https://api-free.deepl.com
 const USE_QUEUE = bool(process.env.USE_QUEUE, false);
 const REDIS_URL = process.env.REDIS_URL || "";
 
-// -------------------- plugins --------------------
+// -------- plugins
 await app.register(cors, {
   origin: ALLOW_ORIGINS.length ? ALLOW_ORIGINS : true
 });
-
 await app.register(helmet, { global: true });
-await app.register(rateLimit, {
-  max: RATE_MAX,
-  timeWindow: RATE_WINDOW
-});
+await app.register(rateLimit, { max: RATE_MAX, timeWindow: RATE_WINDOW });
 await app.register(compress);
 
 await app.register(swagger, {
   openapi: {
-    info: {
-      title: "SoulLift API",
-      version: "1.0.0"
-    }
+    info: { title: "SoulLift API", version: "1.0.0" }
   }
 });
-
-await app.register(swaggerUI, {
-  routePrefix: "/docs",
-  uiConfig: { docExpansion: "list", deepLinking: true }
-});
+await app.register(swaggerUI, { routePrefix: "/docs" });
 
 // Prometheus metrics at /metrics
 await app.register(metrics, {
@@ -93,23 +69,21 @@ await app.register(metrics, {
   defaultMetrics: { enabled: true }
 });
 
-// -------------------- queue (optional) --------------------
-let redis, translateQueue, queueEvents;
+// -------- queue (optional)
+let translateQueue;
 if (USE_QUEUE && REDIS_URL) {
-  redis = new IORedis(REDIS_URL);
+  const connection = new IORedis(REDIS_URL);
+  translateQueue = new Queue("translate", { connection });
+  const queueEvents = new QueueEvents("translate", { connection });
 
-  translateQueue = new Queue("translate", { connection: redis });
-  queueEvents = new QueueEvents("translate", { connection: redis });
-
-  // minimal worker example (no-op translate to prove queue works)
   new Worker(
     "translate",
     async (job) => {
-      app.log.info({ jobId: job.id }, "Processing job");
-      // In real app you could call translateText(job.data)
-      return { ok: true, echo: job.data };
+      app.log.info({ jobId: job.id }, "Worker running");
+      // placeholder
+      return { ok: true, data: job.data };
     },
-    { connection: redis }
+    { connection }
   );
 
   queueEvents.on("completed", ({ jobId }) => {
@@ -117,46 +91,31 @@ if (USE_QUEUE && REDIS_URL) {
   });
 }
 
-// -------------------- services --------------------
-// OpenAI → DeepL fallback translator (simple, safe defaults)
+// -------- translation services
 async function translateWithOpenAI(text, targetLang) {
-  if (!OPENAI_KEYS.length || !USE_OPENAI) return null;
-
-  // Use the first available key; you could randomize for rotation
+  if (!USE_OPENAI || !OPENAI_KEYS.length) return null;
   const key = OPENAI_KEYS[0];
 
-  // minimal chat call that asks model to return *only* the translated text
   const body = {
     model: "gpt-4o-mini",
     messages: [
-      {
-        role: "system",
-        content:
-          "You are a translation engine. Return ONLY the translated text, no explanations."
-      },
-      {
-        role: "user",
-        content: `Translate to ${targetLang}:\n${text}`
-      }
+      { role: "system", content: "Return ONLY the translated text." },
+      { role: "user", content: `Translate to ${targetLang}:\n${text}` }
     ],
     temperature: 0.2
   };
 
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${key}`,
-      "Content-Type": "application/json"
-    },
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
 
-  if (!resp.ok) {
-    const err = await resp.text().catch(() => "");
-    throw new Error(`OpenAI error: ${resp.status} ${err}`.slice(0, 500));
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`OpenAI ${res.status} ${t}`.slice(0, 300));
   }
-
-  const data = await resp.json();
+  const data = await res.json();
   return data?.choices?.[0]?.message?.content?.trim() || null;
 }
 
@@ -169,80 +128,64 @@ async function translateWithDeepL(text, targetLang) {
     target_lang: String(targetLang || "EN").toUpperCase()
   });
 
-  const resp = await fetch(`${DEEPL_ENDPOINT}/v2/translate`, {
+  const res = await fetch(`${DEEPL_ENDPOINT}/v2/translate`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: params
   });
 
-  if (!resp.ok) {
-    const err = await resp.text().catch(() => "");
-    throw new Error(`DeepL error: ${resp.status} ${err}`.slice(0, 500));
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`DeepL ${res.status} ${t}`.slice(0, 300));
   }
-
-  const data = await resp.json();
+  const data = await res.json();
   return data?.translations?.[0]?.text || null;
 }
 
-// Main translate (OpenAI first, DeepL fallback)
 async function translateText(text, targetLang = "EN") {
   if (!text) return "";
-
-  // Try OpenAI first
   try {
-    const out = await translateWithOpenAI(text, targetLang);
-    if (out) return out;
+    const a = await translateWithOpenAI(text, targetLang);
+    if (a) return a;
   } catch (e) {
-    app.log.warn({ err: String(e).slice(0, 200) }, "OpenAI failed, falling back to DeepL");
+    app.log.warn({ err: String(e).slice(0, 200) }, "OpenAI failed; fallback DeepL");
   }
-
-  // Fallback DeepL
   try {
-    const out = await translateWithDeepL(text, targetLang);
-    if (out) return out;
+    const b = await translateWithDeepL(text, targetLang);
+    if (b) return b;
   } catch (e) {
     app.log.warn({ err: String(e).slice(0, 200) }, "DeepL failed");
   }
-
-  // Final fallback: original text
-  return text;
+  return text; // final fallback
 }
 
-// -------------------- routes --------------------
-app.get("/", async () => {
-  return { ok: true, name: "SoulLift", uptime: process.uptime() };
-});
-
+// -------- routes
+app.get("/", async () => ({ ok: true, name: "SoulLift", uptime: process.uptime() }));
 app.get("/healthz", async () => ({ status: "ok" }));
 
 app.post("/api/translate", async (req, rep) => {
-  const body = (req.body ?? {});
+  const body = req.body || {};
   const text = body.text ?? "";
   const target = body.target ?? "EN";
+  if (!text) return rep.code(400).send({ error: "Missing 'text' in body" });
 
-  if (!text) {
-    return rep.code(400).send({ error: "Missing 'text' in body" });
-  }
   const translated = await translateText(text, target);
   return { text, target, translated };
 });
 
 app.get("/api/quote", async () => {
-  // Placeholder endpoint – in app reală vei extrage din DB/AI.
   const quote = "Your future is created by what you do today, not tomorrow.";
   const translated = await translateText(quote, "RO");
   return { quote, translated };
 });
 
-// Optional queue test
 app.post("/api/queue/test", async (req, rep) => {
   if (!translateQueue) return rep.code(503).send({ error: "Queue not enabled" });
-  const payload = { when: Date.now(), sample: "hello" };
-  const job = await translateQueue.add("sample", payload, { removeOnComplete: true, removeOnFail: true });
+  const job = await translateQueue.add("sample", { now: Date.now() }, { removeOnComplete: true, removeOnFail: true });
   return { queued: true, jobId: job.id };
 });
 
-// -------------------- start --------------------
+// -------- start
 try {
   await app.listen({ port: PORT, host: "0.0.0.0" });
   app.log.info(`SoulLift listening on :${PORT}`);
