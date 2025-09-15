@@ -1,13 +1,16 @@
 {
-  "name": "soul-lift-backend-ultra-min",
+  "name": "soul-lift-backend-pro",
   "version": "1.0.0",
-  "description": "Ultra-minimal Fastify backend for Render (no build).",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "@fastify/cors": "^8.4.2",
-    "fastify": "^4.26.2"
+    "@fastify/cors": "^9.0.0",
+    "fastify": "^4.28.1"
   }
 }
