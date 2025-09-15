@@ -1,189 +1,252 @@
-// --- Core & setup ---
+// SoulLift backend (Fastify v4, ESM)
+// Features: CORS, Helmet, RateLimit, Compress, Swagger, Prometheus metrics,
+// OpenAI → DeepL translation fallback, optional BullMQ + Redis queue.
+
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import compress from "@fastify/compress";
+import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
+import compress from "@fastify/compress";
 import swagger from "@fastify/swagger";
-import metrics from "@fastify/metrics";
-import Redis from "ioredis";
-import fetch from "node-fetch";
+import swaggerUI from "@fastify/swagger-ui";
+import metrics from "fastify-metrics";
+import { Queue, Worker, QueueEvents } from "bullmq";
+import IORedis from "ioredis";
 
-// Env vars
-const USE_OPENAI = String(process.env.USE_OPENAI || "").toLowerCase() === "true";
-const USE_QUEUE = String(process.env.USE_QUEUE || "").toLowerCase() === "true";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_ENDPOINT = process.env.OPENAI_ENDPOINT || "https://api.openai.com";
+// -------------------- helpers --------------------
+const isProd = process.env.NODE_ENV === "production";
+
+const logger =
+  isProd
+    ? { level: "info" }
+    : {
+        level: "debug",
+        transport: { target: "pino-pretty", options: { translateTime: "SYS:standard" } }
+      };
+
+const app = Fastify({ logger });
+
+const bool = (v, def = false) => {
+  if (v === undefined) return def;
+  return ["1", "true", "yes", "on"].includes(String(v).toLowerCase());
+};
+
+const num = (v, def) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+};
+
+const asCsv = (v) =>
+  String(v || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+// -------------------- env --------------------
+const PORT = num(process.env.PORT, 3000);
+
+const ALLOW_ORIGINS =
+  asCsv(process.env.ALLOW_ORIGINS || process.env.ORIGIN);
+const RATE_MAX = num(process.env.RATE_MAX, 120); // req / window
+const RATE_WINDOW = num(process.env.RATE_WINDOW, 60_000); // ms
+
+const USE_OPENAI = bool(process.env.USE_OPENAI, true);
+const OPENAI_PRIMARY = process.env.OPENAI_API_KEY || "";
+const OPENAI_POOL = asCsv(process.env.API_KEYS);
+const OPENAI_KEYS = [OPENAI_PRIMARY, ...OPENAI_POOL].filter(Boolean);
+
 const DEEPL_API_KEY = process.env.DEEPL_API_KEY || "";
+const DEEPL_ENDPOINT = process.env.DEEPL_ENDPOINT || "https://api-free.deepl.com";
+
+const USE_QUEUE = bool(process.env.USE_QUEUE, false);
 const REDIS_URL = process.env.REDIS_URL || "";
-const PORT = process.env.PORT || 3000;
 
-// Supported languages
-const SUPPORTED_LANGS = [
-  "ro", "en", "es", "fr", "de", "zh", "hi", "ar",
-  "pt", "bn", "ru", "ja", "it"
-];
+// -------------------- plugins --------------------
+await app.register(cors, {
+  origin: ALLOW_ORIGINS.length ? ALLOW_ORIGINS : true
+});
 
-// Redis
-let redis;
+await app.register(helmet, { global: true });
+await app.register(rateLimit, {
+  max: RATE_MAX,
+  timeWindow: RATE_WINDOW
+});
+await app.register(compress);
+
+await app.register(swagger, {
+  openapi: {
+    info: {
+      title: "SoulLift API",
+      version: "1.0.0"
+    }
+  }
+});
+
+await app.register(swaggerUI, {
+  routePrefix: "/docs",
+  uiConfig: { docExpansion: "list", deepLinking: true }
+});
+
+// Prometheus metrics at /metrics
+await app.register(metrics, {
+  endpoint: "/metrics",
+  defaultMetrics: { enabled: true }
+});
+
+// -------------------- queue (optional) --------------------
+let redis, translateQueue, queueEvents;
 if (USE_QUEUE && REDIS_URL) {
-  redis = new Redis(REDIS_URL, { tls: {} });
+  redis = new IORedis(REDIS_URL);
+
+  translateQueue = new Queue("translate", { connection: redis });
+  queueEvents = new QueueEvents("translate", { connection: redis });
+
+  // minimal worker example (no-op translate to prove queue works)
+  new Worker(
+    "translate",
+    async (job) => {
+      app.log.info({ jobId: job.id }, "Processing job");
+      // In real app you could call translateText(job.data)
+      return { ok: true, echo: job.data };
+    },
+    { connection: redis }
+  );
+
+  queueEvents.on("completed", ({ jobId }) => {
+    app.log.info({ jobId }, "Job completed");
+  });
 }
 
-// Fastify instance
-const fastify = Fastify({
-  logger: { transport: { target: "pino-pretty" } }
-});
+// -------------------- services --------------------
+// OpenAI → DeepL fallback translator (simple, safe defaults)
+async function translateWithOpenAI(text, targetLang) {
+  if (!OPENAI_KEYS.length || !USE_OPENAI) return null;
 
-// --- Plugins ---
-await fastify.register(cors, { origin: true });
-await fastify.register(compress);
-await fastify.register(rateLimit, { max: 100, timeWindow: "1 minute" });
-await fastify.register(swagger, { openapi: { info: { title: "SoulLift API", version: "1.0.0" } } });
-await fastify.register(metrics, { endpoint: "/metrics" });
+  // Use the first available key; you could randomize for rotation
+  const key = OPENAI_KEYS[0];
 
-// --- Local quotes fallback ---
-const localQuotes = [
-  { id: 1, text: "Succesul nu este final, eșecul nu este fatal: curajul de a continua contează.", author: "W. Churchill", lang: "ro" },
-  { id: 2, text: "Nu judeca fiecare zi după recolta pe care o culegi, ci după semințele pe care le plantezi.", author: "R. L. Stevenson", lang: "ro" },
-  { id: 3, text: "The only way to do great work is to love what you do.", author: "Steve Jobs", lang: "en" },
-  { id: 4, text: "Whether you think you can or you think you can’t, you’re right.", author: "Henry Ford", lang: "en" }
-];
-
-function pickLocal(lang) {
-  const pool = lang ? localQuotes.filter(q => q.lang === lang) : localQuotes;
-  return pool[Math.floor(Math.random() * pool.length)];
-}
-
-// --- Routes ---
-fastify.get("/health", async () => ({ ok: true, ts: Date.now() }));
-
-fastify.get("/ready", async () => ({
-  openaiConfigured: !!OPENAI_API_KEY,
-  deeplConfigured: !!DEEPL_API_KEY,
-  queue: !!redis
-}));
-
-// Random local
-fastify.get("/quotes/random", async (req, reply) => {
-  const { lang } = req.query || {};
-  const q = pickLocal(lang);
-  reply.header("X-Source", "local");
-  return q;
-});
-
-// AI-powered quote
-fastify.get("/v1/quote", async (req, reply) => {
-  const { lang = "en", category = "motivation" } = req.query || {};
-
-  // fallback local
-  if (!SUPPORTED_LANGS.includes(lang)) {
-    reply.header("X-Source", "local-fallback");
-    return pickLocal("en");
-  }
-
-  // Try OpenAI
-  if (USE_OPENAI && OPENAI_API_KEY) {
-    try {
-      const r = await fetch(`${OPENAI_ENDPOINT}/v1/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          temperature: 0.7,
-          max_tokens: 60,
-          messages: [
-            { role: "system", content: "You are a concise assistant. Return a short motivational quote only." },
-            { role: "user", content: `Give me one short motivational quote in ${lang}, topic: ${category}. No emojis.` }
-          ]
-        })
-      });
-
-      if (r.ok) {
-        const data = await r.json();
-        const content = data?.choices?.[0]?.message?.content?.trim();
-        if (content) {
-          reply.header("X-Source", "openai");
-          return { id: Date.now(), text: content, author: "AI", lang };
-        }
-      }
-    } catch (err) {
-      fastify.log.error(err);
-    }
-  }
-
-  // Try DeepL translation (fallback)
-  if (DEEPL_API_KEY) {
-    try {
-      const baseQuote = pickLocal("en");
-      const r = await fetch(`https://api-free.deepl.com/v2/translate`, {
-        method: "POST",
-        headers: {
-          Authorization: `DeepL-Auth-Key ${DEEPL_API_KEY}`,
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        body: new URLSearchParams({ text: baseQuote.text, target_lang: lang.toUpperCase() })
-      });
-
-      if (r.ok) {
-        const data = await r.json();
-        const translated = data?.translations?.[0]?.text;
-        if (translated) {
-          reply.header("X-Source", "deepl");
-          return { id: Date.now(), text: translated, author: baseQuote.author, lang };
-        }
-      }
-    } catch (err) {
-      fastify.log.error(err);
-    }
-  }
-
-  // fallback local
-  reply.header("X-Source", "local-fallback");
-  return pickLocal(lang);
-});
-
-// AI fixer
-fastify.post("/ai/fix", async (req, reply) => {
-  const { message, stack, context } = req.body || {};
-  if (!USE_OPENAI || !OPENAI_API_KEY) {
-    return { usedAI: false, cause: "AI dezactivat", fix_steps: ["Activează USE_OPENAI și setează OPENAI_API_KEY."] };
-  }
-  try {
-    const r = await fetch(`${OPENAI_ENDPOINT}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
+  // minimal chat call that asks model to return *only* the translated text
+  const body = {
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a translation engine. Return ONLY the translated text, no explanations."
       },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        temperature: 0.2,
-        messages: [
-          { role: "system", content: "You are a senior engineer. Return JSON: {cause, fix_steps[], patch_snippet, risk_notes}." },
-          { role: "user", content: `Error: ${message}\nStack: ${stack}\nContext: ${JSON.stringify(context)}` }
-        ],
-        response_format: { type: "json_object" }
-      })
-    });
+      {
+        role: "user",
+        content: `Translate to ${targetLang}:\n${text}`
+      }
+    ],
+    temperature: 0.2
+  };
 
-    if (r.ok) {
-      const data = await r.json();
-      return { usedAI: true, ...(JSON.parse(data?.choices?.[0]?.message?.content || "{}")) };
-    }
-  } catch (err) {
-    fastify.log.error(err);
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${key}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text().catch(() => "");
+    throw new Error(`OpenAI error: ${resp.status} ${err}`.slice(0, 500));
   }
-  return { usedAI: false, cause: "Eroare locală la AI." };
+
+  const data = await resp.json();
+  return data?.choices?.[0]?.message?.content?.trim() || null;
+}
+
+async function translateWithDeepL(text, targetLang) {
+  if (!DEEPL_API_KEY) return null;
+
+  const params = new URLSearchParams({
+    auth_key: DEEPL_API_KEY,
+    text,
+    target_lang: String(targetLang || "EN").toUpperCase()
+  });
+
+  const resp = await fetch(`${DEEPL_ENDPOINT}/v2/translate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text().catch(() => "");
+    throw new Error(`DeepL error: ${resp.status} ${err}`.slice(0, 500));
+  }
+
+  const data = await resp.json();
+  return data?.translations?.[0]?.text || null;
+}
+
+// Main translate (OpenAI first, DeepL fallback)
+async function translateText(text, targetLang = "EN") {
+  if (!text) return "";
+
+  // Try OpenAI first
+  try {
+    const out = await translateWithOpenAI(text, targetLang);
+    if (out) return out;
+  } catch (e) {
+    app.log.warn({ err: String(e).slice(0, 200) }, "OpenAI failed, falling back to DeepL");
+  }
+
+  // Fallback DeepL
+  try {
+    const out = await translateWithDeepL(text, targetLang);
+    if (out) return out;
+  } catch (e) {
+    app.log.warn({ err: String(e).slice(0, 200) }, "DeepL failed");
+  }
+
+  // Final fallback: original text
+  return text;
+}
+
+// -------------------- routes --------------------
+app.get("/", async () => {
+  return { ok: true, name: "SoulLift", uptime: process.uptime() };
 });
 
-// --- Start server ---
+app.get("/healthz", async () => ({ status: "ok" }));
+
+app.post("/api/translate", async (req, rep) => {
+  const body = (req.body ?? {});
+  const text = body.text ?? "";
+  const target = body.target ?? "EN";
+
+  if (!text) {
+    return rep.code(400).send({ error: "Missing 'text' in body" });
+  }
+  const translated = await translateText(text, target);
+  return { text, target, translated };
+});
+
+app.get("/api/quote", async () => {
+  // Placeholder endpoint – in app reală vei extrage din DB/AI.
+  const quote = "Your future is created by what you do today, not tomorrow.";
+  const translated = await translateText(quote, "RO");
+  return { quote, translated };
+});
+
+// Optional queue test
+app.post("/api/queue/test", async (req, rep) => {
+  if (!translateQueue) return rep.code(503).send({ error: "Queue not enabled" });
+  const payload = { when: Date.now(), sample: "hello" };
+  const job = await translateQueue.add("sample", payload, { removeOnComplete: true, removeOnFail: true });
+  return { queued: true, jobId: job.id };
+});
+
+// -------------------- start --------------------
 try {
-  await fastify.listen({ port: PORT, host: "0.0.0.0" });
-  fastify.log.info(`🚀 Server running on port ${PORT}`);
+  await app.listen({ port: PORT, host: "0.0.0.0" });
+  app.log.info(`SoulLift listening on :${PORT}`);
 } catch (err) {
-  fastify.log.error(err);
+  app.log.error(err);
   process.exit(1);
 }
