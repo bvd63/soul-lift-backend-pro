@@ -1,6 +1,6 @@
 {
   "name": "soul-lift-backend-pro",
-  "version": "3.3.2",
+  "version": "3.3.3",
   "description": "SoulLift backend: Fastify, Swagger, metrics, OpenAI -> DeepL fallback, optional BullMQ.",
   "main": "index.js",
   "type": "module",
@@ -14,7 +14,7 @@
   "dependencies": {
     "fastify": "4.28.1",
     "@fastify/cors": "10.0.1",
-    "@fastify/helmet": "12.4.0",
+    "@fastify/helmet": "9.1.0",
     "@fastify/rate-limit": "10.1.0",
     "@fastify/compress": "8.1.0",
     "@fastify/swagger": "8.14.0",
