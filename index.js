@@ -1,9 +1,8 @@
 const fastify = require('fastify')({ logger: true });
 const cors = require('@fastify/cors');
-const fetch = require('node-fetch');
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const OPENAI_ENDPOINT = process.env.OPENAI_ENDPOINT || '';
+const OPENAI_ENDPOINT = process.env.OPENAI_ENDPOINT || 'https://api.openai.com';
 
 async function build() {
   await fastify.register(cors, { origin: '*' });
@@ -19,19 +18,18 @@ async function build() {
     ]
   };
 
-  // Ruta simplă de test
   fastify.get('/main', async () => {
-    return { ok: true, backend: OPENAI_API_KEY ? 'live' : 'fallback' }
+    return { ok: true, backend: OPENAI_API_KEY ? 'live' : 'fallback' };
   });
 
-  // Ruta existentă pentru citat cu OpenAI
   fastify.get('/v1/quote', async (request, reply) => {
     const q = request.query || {};
     const lang = (q.lang || 'en').toLowerCase();
     const category = (q.category || 'motivation').toLowerCase();
 
     if (!OPENAI_API_KEY) {
-      return (fallback[category] || fallback[lang] || fallback['en'])[0];
+      const pool = fallback[lang] || fallback.en;
+      return pool[0];
     }
 
     const prompt = `Generează un citat scurt (max 20 cuvinte) potrivit pentru ${category} în limba ${lang}. Fără autor, fără emoji.`;
@@ -53,7 +51,6 @@ async function build() {
 
       const data = await result.json();
       const content = data.choices?.[0]?.message?.content?.trim() || 'No response';
-
       return { text: content, author: 'AI', lang };
     } catch (err) {
       fastify.log.error(err);
@@ -61,7 +58,7 @@ async function build() {
     }
   });
 
-  // 🔥 Noua rută pentru citate random locale
+  // Noua rută pentru citat random local
   fastify.get('/quotes/random', async (request, reply) => {
     const { lang } = request.query;
 
@@ -73,9 +70,7 @@ async function build() {
     ];
 
     const pool = lang ? quotes.filter(q => q.lang === lang) : quotes;
-    if (!pool.length) {
-      return reply.code(404).send({ error: 'No quotes for selected language.' });
-    }
+    if (!pool.length) return reply.code(404).send({ error: 'No quotes for selected language.' });
 
     const q = pool[Math.floor(Math.random() * pool.length)];
     return q;
