@@ -9,7 +9,7 @@
     "dev": "NODE_ENV=development node index.js"
   },
   "dependencies": {
-    "@fastify/compress": "7.0.0",
+    "@fastify/compress": "6.2.1",
     "@fastify/cors": "8.2.1",
     "@fastify/helmet": "10.1.1",
     "@fastify/rate-limit": "7.7.0",
