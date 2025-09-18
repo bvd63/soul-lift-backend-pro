@@ -1,26 +1,23 @@
 {
   "name": "soul-lift-backend-pro",
-  "version": "3.3.4",
-  "description": "SoulLift backend: Fastify, Swagger, metrics, OpenAI -> DeepL fallback, optional BullMQ.",
-  "main": "index.js",
+  "version": "1.0.0",
+  "description": "AI quotes API for SoulLift (motivational, focus, calm) — Fastify v4 + OpenAI/DeepL fallback",
   "type": "module",
   "engines": {
-    "node": ">=18.17.0"
+    "node": ">=18.0.0"
   },
   "scripts": {
     "start": "node index.js",
     "dev": "NODE_ENV=development node index.js"
   },
   "dependencies": {
-    "fastify": "4.28.1",
-    "@fastify/cors": "8.3.0",
-    "@fastify/helmet": "9.1.0",
-    "@fastify/rate-limit": "7.6.0",
-    "@fastify/compress": "7.0.2",
-    "@fastify/swagger": "8.14.0",
-    "@fastify/swagger-ui": "4.0.0",
-    "fastify-metrics": "10.3.0",
-    "bullmq": "5.12.0",
-    "ioredis": "5.4.1"
+    "@fastify/compress": "^7.0.0",
+    "@fastify/cors": "^10.0.0",
+    "@fastify/helmet": "^12.0.0",
+    "@fastify/rate-limit": "^10.1.0",
+    "@fastify/swagger": "^8.14.0",
+    "@fastify/swagger-ui": "^3.0.0",
+    "fastify": "^4.28.1",
+    "fastify-metrics": "10.3.0"
   }
 }
