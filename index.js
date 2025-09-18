@@ -14,7 +14,7 @@ import fs from "fs";
 import fetch from "node-fetch";
 import cron from "node-cron";
 import Stripe from "stripe";
-import rawBody from "@fastify/raw-body"; // pentru webhook Stripe raw
+import fastifyRawBody from "fastify-raw-body"; // ✅ raw body corect pentru Stripe
 
 import cache from "./src/utils/memoryCache.js";
 
@@ -58,17 +58,15 @@ await app.register(swagger, {
 await app.register(swaggerUI, { routePrefix: "/docs" });
 await app.register(metrics, { endpoint: "/metrics", defaultMetrics: { enabled: true } });
 
-// raw body doar dacă e nevoie global (stripe webhook îl cere per-route, dar pluginul atașează req.rawBody)
-await app.register(rawBody, {
+// ✅ raw body pentru Stripe (doar unde cerem config.rawBody)
+await app.register(fastifyRawBody, {
   field: "rawBody",
   global: false,
-  runFirst: true, // să prindă corpul înainte de parsare
+  runFirst: true
 });
 
 // ----------------- in-memory stores
-// ATENȚIE: pe Render e ephemeral; pentru producție migrează la Postgres/Redis.
 const users = new Map(); // key = email, value = user object
-
 let stats = {
   quotes: 0,
   translations: 0,
@@ -88,11 +86,11 @@ const QUOTES = [
   { id: "q1", text: "Your future is created by what you do today, not tomorrow.", author: "Robert Kiyosaki", source: "Interview", year: 2001, premium: false },
   { id: "q2", text: "Success is not for the lazy.", author: "Jim Rohn", source: "Seminar", year: 1985, premium: false },
   { id: "q3", text: "Focus on progress, not perfection.", author: "Bill Gates", source: "Talk", year: 2010, premium: false },
-  { id: "q4", text: "Gratitude turns what we have into enough.", author: "Aesop", source: "Fables", year: -550, premium: true },
+  { id: "q4", text: "Gratitude turns what we have into enough.", author: "Aesop", source: "Fables", year: -550, premium: true }
 ];
 const PREMIUM_COLLECTIONS = [
   { id: "stoicism", name: "Stoicism Starter", items: ["q4"] },
-  { id: "deep-focus", name: "Deep Focus", items: ["q2", "q3"] },
+  { id: "deep-focus", name: "Deep Focus", items: ["q2", "q3"] }
 ];
 const SUPPORTED_LANGS = ["EN","RO","FR","DE","ES","IT","PT","RU","JA","ZH","NL","PL","TR"];
 
@@ -196,7 +194,7 @@ function getOrCreateUserByEmail(email) {
         tier: "free",       // free | pro
         currentPeriodEnd: null,
         stripeCustomerId: null,
-        stripeSubId: null,
+        stripeSubId: null
       }
     });
   }
@@ -418,7 +416,7 @@ app.get("/api/billing/portal", { preHandler: [authMiddleware] }, async (req, rep
   return { ok: true, url: portal.url };
 });
 
-// Webhook Stripe — folosește rawBody (plugin @fastify/raw-body)
+// Webhook Stripe — folosește rawBody (plugin fastify-raw-body)
 app.route({
   method: "POST",
   url: "/api/stripe/webhook",
@@ -442,14 +440,12 @@ app.route({
         const customerId = session.customer;
         const subId = session.subscription;
 
-        // găsește userul după customerId sau email (fallback)
         const user = findUserByCustomerOrEmail(customerId, session.customer_details?.email);
         if (user) {
           user.subscription.status = "active";
           user.subscription.tier = "pro";
           user.subscription.stripeCustomerId = customerId;
           user.subscription.stripeSubId = subId;
-          // încarcă sub pentru current period end
           try {
             const sub = await stripe.subscriptions.retrieve(subId);
             if (sub?.current_period_end) {
@@ -494,7 +490,6 @@ app.route({
         break;
       }
       default:
-        // Ignorăm restul, dar logăm tipul pentru debug
         app.log.debug(`Unhandled Stripe event: ${event.type}`);
     }
 
