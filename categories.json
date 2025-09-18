@@ -1,6 +1,14 @@
 [
   { "id": "motivation", "name": "Motivation", "premium": false },
-  { "id": "focus", "name": "Focus", "premium": false },
-  { "id": "calm", "name": "Calm", "premium": false },
-  { "id": "gratitude", "name": "Gratitude", "premium": false }
+  { "id": "focus", "name": "Focus & Productivity", "premium": false },
+  { "id": "calm", "name": "Calm & Mindfulness", "premium": false },
+  { "id": "gratitude", "name": "Gratitude", "premium": false },
+  { "id": "success", "name": "Success & Growth", "premium": true },
+  { "id": "love", "name": "Love & Relationships", "premium": true },
+  { "id": "wisdom", "name": "Wisdom & Philosophy", "premium": true },
+  { "id": "hustle", "name": "Hustle & Ambition", "premium": true },
+  { "id": "stoicism", "name": "Stoicism", "premium": true },
+  { "id": "mindset", "name": "Positive Mindset", "premium": false },
+  { "id": "healing", "name": "Healing & Recovery", "premium": true },
+  { "id": "life", "name": "Life Lessons", "premium": false }
 ]
