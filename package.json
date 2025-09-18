@@ -16,6 +16,7 @@
     "@fastify/swagger": "8.10.0",
     "@fastify/swagger-ui": "1.9.3",
     "@fastify/compress": "6.2.0",
-    "fastify-metrics": "10.3.0"
+    "fastify-metrics": "10.3.0",
+    "jsonwebtoken": "9.0.2"
   }
 }
