@@ -1,6 +1,6 @@
 {
   "name": "soul-lift-backend",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "SoulLift motivational quotes backend (Fastify + Stripe + OpenAI + DeepL)",
   "main": "index.js",
   "type": "module",
