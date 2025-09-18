@@ -1,8 +1,7 @@
 // SoulLift backend — Fastify v4 (ESM)
 // Features: CORS, Helmet, RateLimit, Compress, Swagger, Prometheus metrics,
-// OpenAI -> DeepL fallback (DeepL ca fallback). Fără Redis/BullMQ.
+// OpenAI -> DeepL fallback, JWT users, favorites, stats, subscription, notify
 
-// ----------------- imports
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
@@ -11,8 +10,8 @@ import compress from "@fastify/compress";
 import swagger from "@fastify/swagger";
 import swaggerUI from "@fastify/swagger-ui";
 import metrics from "fastify-metrics";
+import jwt from "jsonwebtoken";
 
-// cache simplu în memorie (ESM)
 import cache from "./src/utils/memoryCache.js";
 
 // ----------------- utils
@@ -46,6 +45,8 @@ const OPENAI_KEYS = [OPENAI_PRIMARY, ...csv(process.env.API_KEYS)].filter(Boolea
 const DEEPL_API_KEY = process.env.DEEPL_API_KEY || "";
 const DEEPL_ENDPOINT = process.env.DEEPL_ENDPOINT || "https://api-free.deepl.com";
 
+const JWT_SECRET = process.env.JWT_SECRET || "soul-lift-secret";
+
 // ----------------- plugins
 await app.register(cors, {
   origin: ALLOW_ORIGINS.length ? ALLOW_ORIGINS : true,
@@ -56,7 +57,7 @@ await app.register(compress);
 
 await app.register(swagger, {
   openapi: {
-    info: { title: "SoulLift API", version: "1.0.0" },
+    info: { title: "SoulLift API", version: "2.0.0" },
   },
 });
 await app.register(swaggerUI, { routePrefix: "/docs" });
@@ -66,6 +67,10 @@ await app.register(metrics, {
   endpoint: "/metrics",
   defaultMetrics: { enabled: true },
 });
+
+// ----------------- in-memory stores
+const users = new Map(); // email -> {password, premium, favorites: []}
+let stats = { quotes: 0, translations: 0 };
 
 // ----------------- translation services
 async function translateWithOpenAI(text, targetLang) {
@@ -122,17 +127,37 @@ async function translateText(text, targetLang = "EN") {
   if (!text) return "";
   try {
     const a = await translateWithOpenAI(text, targetLang);
-    if (a) return a;
+    if (a) {
+      stats.translations++;
+      return a;
+    }
   } catch (e) {
     app.log.warn({ err: String(e).slice(0, 200) }, "OpenAI failed; fallback DeepL");
   }
   try {
     const b = await translateWithDeepL(text, targetLang);
-    if (b) return b;
+    if (b) {
+      stats.translations++;
+      return b;
+    }
   } catch (e) {
     app.log.warn({ err: String(e).slice(0, 200) }, "DeepL failed");
   }
   return text; // fallback final
+}
+
+// ----------------- auth utils
+function authMiddleware(req, rep, done) {
+  const auth = req.headers.authorization;
+  if (!auth) return rep.code(401).send({ error: "Missing Authorization header" });
+  const token = auth.split(" ")[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    done();
+  } catch {
+    return rep.code(401).send({ error: "Invalid token" });
+  }
 }
 
 // ----------------- routes
@@ -150,14 +175,15 @@ app.post("/api/translate", async (req, rep) => {
   return { text, target, translated };
 });
 
-// quote endpoint (demo)
+// quote endpoint
 app.get("/api/quote", async () => {
   const quote = "Your future is created by what you do today, not tomorrow.";
   const translated = await translateText(quote, "RO");
+  stats.quotes++;
   return { quote, translated };
 });
 
-// categories endpoint (with memory cache, TTL 10 min)
+// categories endpoint (with memory cache)
 app.get("/api/categories", async () => {
   const KEY = "soul:categories:v1";
   const cached = cache.get(KEY);
@@ -172,6 +198,68 @@ app.get("/api/categories", async () => {
 
   cache.set(KEY, cats, 600);
   return cats;
+});
+
+// user register
+app.post("/api/register", async (req, rep) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return rep.code(400).send({ error: "Missing email or password" });
+  if (users.has(email)) return rep.code(400).send({ error: "User already exists" });
+
+  users.set(email, { password, premium: false, favorites: [] });
+  return { ok: true };
+});
+
+// user login
+app.post("/api/login", async (req, rep) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return rep.code(400).send({ error: "Missing email or password" });
+
+  const user = users.get(email);
+  if (!user || user.password !== password) return rep.code(401).send({ error: "Invalid credentials" });
+
+  const token = jwt.sign({ email }, JWT_SECRET, { expiresIn: "1h" });
+  return { token, premium: user.premium };
+});
+
+// favorites list
+app.get("/api/favorites", { preHandler: authMiddleware }, async (req) => {
+  const user = users.get(req.user.email);
+  return user.favorites;
+});
+
+// favorites add
+app.post("/api/favorites/add", { preHandler: authMiddleware }, async (req, rep) => {
+  const { quote } = req.body || {};
+  if (!quote) return rep.code(400).send({ error: "Missing quote" });
+  const user = users.get(req.user.email);
+  user.favorites.push(quote);
+  return { ok: true };
+});
+
+// favorites remove
+app.post("/api/favorites/remove", { preHandler: authMiddleware }, async (req, rep) => {
+  const { quote } = req.body || {};
+  if (!quote) return rep.code(400).send({ error: "Missing quote" });
+  const user = users.get(req.user.email);
+  user.favorites = user.favorites.filter((q) => q !== quote);
+  return { ok: true };
+});
+
+// stats
+app.get("/api/stats", async () => stats);
+
+// subscription
+app.get("/api/subscription", { preHandler: authMiddleware }, async (req) => {
+  const user = users.get(req.user.email);
+  return { premium: user.premium };
+});
+
+// notifications (dummy)
+app.post("/api/notify/test", async (req) => {
+  const { message } = req.body || {};
+  app.log.info(`Notify: ${message || "Hello from SoulLift!"}`);
+  return { ok: true };
 });
 
 // ----------------- start
