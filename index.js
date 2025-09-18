@@ -1,7 +1,8 @@
 // SoulLift backend — Fastify v4 (ESM)
 // Features: CORS, Helmet, RateLimit, Compress, Swagger, Prometheus metrics,
-// OpenAI -> DeepL fallback, BullMQ/Redis (optional)
+// OpenAI -> DeepL fallback (DeepL ca fallback). Fără Redis/BullMQ.
 
+// ----------------- imports
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
@@ -10,10 +11,11 @@ import compress from "@fastify/compress";
 import swagger from "@fastify/swagger";
 import swaggerUI from "@fastify/swagger-ui";
 import metrics from "fastify-metrics";
-import { Queue, Worker, QueueEvents } from "bullmq";
-import IORedis from "ioredis";
 
-// -------- utils
+// cache simplu în memorie (ESM)
+import cache from "./src/utils/memoryCache.js";
+
+// ----------------- utils
 const isProd = process.env.NODE_ENV === "production";
 const app = Fastify({ logger: { level: isProd ? "info" : "debug" } });
 
@@ -31,9 +33,8 @@ const csv = (v) =>
     .map((s) => s.trim())
     .filter(Boolean);
 
-// -------- env
+// ----------------- env
 const PORT = num(process.env.PORT, 3000);
-
 const ALLOW_ORIGINS = csv(process.env.ALLOW_ORIGINS || process.env.ORIGIN);
 const RATE_MAX = num(process.env.RATE_MAX, 120);
 const RATE_WINDOW = num(process.env.RATE_WINDOW, 60_000);
@@ -45,12 +46,9 @@ const OPENAI_KEYS = [OPENAI_PRIMARY, ...csv(process.env.API_KEYS)].filter(Boolea
 const DEEPL_API_KEY = process.env.DEEPL_API_KEY || "";
 const DEEPL_ENDPOINT = process.env.DEEPL_ENDPOINT || "https://api-free.deepl.com";
 
-const USE_QUEUE = bool(process.env.USE_QUEUE, false);
-const REDIS_URL = process.env.REDIS_URL || "";
-
-// -------- plugins
+// ----------------- plugins
 await app.register(cors, {
-  origin: ALLOW_ORIGINS.length ? ALLOW_ORIGINS : true
+  origin: ALLOW_ORIGINS.length ? ALLOW_ORIGINS : true,
 });
 await app.register(helmet, { global: true });
 await app.register(rateLimit, { max: RATE_MAX, timeWindow: RATE_WINDOW });
@@ -58,42 +56,18 @@ await app.register(compress);
 
 await app.register(swagger, {
   openapi: {
-    info: { title: "SoulLift API", version: "1.0.0" }
-  }
+    info: { title: "SoulLift API", version: "1.0.0" },
+  },
 });
 await app.register(swaggerUI, { routePrefix: "/docs" });
 
 // Prometheus metrics at /metrics
 await app.register(metrics, {
   endpoint: "/metrics",
-  defaultMetrics: { enabled: true }
+  defaultMetrics: { enabled: true },
 });
 
-// -------- queue (optional)
-let translateQueue;
-if (USE_QUEUE && REDIS_URL) {
-  const connection = new IORedis(REDIS_URL, {
-  maxRetriesPerRequest: null
-});
-  translateQueue = new Queue("translate", { connection });
-  const queueEvents = new QueueEvents("translate", { connection });
-
-  new Worker(
-    "translate",
-    async (job) => {
-      app.log.info({ jobId: job.id }, "Worker running");
-      // Placeholder
-      return { ok: true, data: job.data };
-    },
-    { connection }
-  );
-
-  queueEvents.on("completed", ({ jobId }) => {
-    app.log.info({ jobId }, "Job completed");
-  });
-}
-
-// -------- translation services
+// ----------------- translation services
 async function translateWithOpenAI(text, targetLang) {
   if (!USE_OPENAI || !OPENAI_KEYS.length) return null;
   const key = OPENAI_KEYS[0];
@@ -102,15 +76,15 @@ async function translateWithOpenAI(text, targetLang) {
     model: "gpt-4o-mini",
     messages: [
       { role: "system", content: "Return ONLY the translated text." },
-      { role: "user", content: `Translate to ${targetLang}:\n${text}` }
+      { role: "user", content: `Translate to ${targetLang}:\n${text}` },
     ],
-    temperature: 0.2
+    temperature: 0.2,
   };
 
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
@@ -127,13 +101,13 @@ async function translateWithDeepL(text, targetLang) {
   const params = new URLSearchParams({
     auth_key: DEEPL_API_KEY,
     text,
-    target_lang: String(targetLang || "EN").toUpperCase()
+    target_lang: String(targetLang || "EN").toUpperCase(),
   });
 
   const res = await fetch(`${DEEPL_ENDPOINT}/v2/translate`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params
+    body: params,
   });
 
   if (!res.ok) {
@@ -161,10 +135,11 @@ async function translateText(text, targetLang = "EN") {
   return text; // fallback final
 }
 
-// -------- routes
+// ----------------- routes
 app.get("/", async () => ({ ok: true, name: "SoulLift", uptime: process.uptime() }));
 app.get("/healthz", async () => ({ status: "ok" }));
 
+// translate endpoint
 app.post("/api/translate", async (req, rep) => {
   const body = req.body || {};
   const text = body.text ?? "";
@@ -175,19 +150,31 @@ app.post("/api/translate", async (req, rep) => {
   return { text, target, translated };
 });
 
+// simple quote endpoint (demo)
 app.get("/api/quote", async () => {
   const quote = "Your future is created by what you do today, not tomorrow.";
   const translated = await translateText(quote, "RO");
   return { quote, translated };
 });
 
-app.post("/api/queue/test", async (req, rep) => {
-  if (!translateQueue) return rep.code(503).send({ error: "Queue not enabled" });
-  const job = await translateQueue.add("sample", { now: Date.now() }, { removeOnComplete: true, removeOnFail: true });
-  return { queued: true, jobId: job.id };
+// categories endpoint (with memory cache, TTL 10 min)
+app.get("/api/categories", async () => {
+  const KEY = "soul:categories:v1";
+  const cached = cache.get(KEY);
+  if (cached) return cached;
+
+  const cats = [
+    { id: "motivation", name: "Motivation", premium: false },
+    { id: "focus", name: "Focus", premium: false },
+    { id: "calm", name: "Calm", premium: false },
+    { id: "gratitude", name: "Gratitude", premium: false },
+  ];
+
+  cache.set(KEY, cats, 600);
+  return cats;
 });
 
-// -------- start
+// ----------------- start
 try {
   await app.listen({ port: PORT, host: "0.0.0.0" });
   app.log.info(`SoulLift listening on :${PORT}`);
