@@ -150,7 +150,7 @@ app.post("/api/translate", async (req, rep) => {
   return { text, target, translated };
 });
 
-// simple quote endpoint (demo)
+// quote endpoint (demo)
 app.get("/api/quote", async () => {
   const quote = "Your future is created by what you do today, not tomorrow.";
   const translated = await translateText(quote, "RO");
