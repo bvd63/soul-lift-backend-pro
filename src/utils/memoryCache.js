@@ -1,6 +1,5 @@
 // src/utils/memoryCache.js (ESM)
 
-// Capacitate maximă cache (500 chei)
 const MAX_KEYS = 500;
 const mem = new Map();
 
