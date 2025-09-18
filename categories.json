@@ -10,5 +10,8 @@
   { "id": "stoicism", "name": "Stoicism", "premium": true },
   { "id": "mindset", "name": "Positive Mindset", "premium": false },
   { "id": "healing", "name": "Healing & Recovery", "premium": true },
-  { "id": "life", "name": "Life Lessons", "premium": false }
+  { "id": "life", "name": "Life Lessons", "premium": false },
+  { "id": "discipline", "name": "Discipline & Consistency", "premium": false },
+  { "id": "courage", "name": "Courage & Resilience", "premium": true },
+  { "id": "creativity", "name": "Creativity & Innovation", "premium": true }
 ]
