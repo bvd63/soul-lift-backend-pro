@@ -1,0 +1,6 @@
+[
+  { "id": "motivation", "name": "Motivation", "premium": false },
+  { "id": "focus", "name": "Focus", "premium": false },
+  { "id": "calm", "name": "Calm", "premium": false },
+  { "id": "gratitude", "name": "Gratitude", "premium": false }
+]
