@@ -1,6 +1,6 @@
 {
   "name": "soul-lift-backend",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "SoulLift motivational quotes backend (Fastify + Stripe + OpenAI + DeepL)",
   "main": "index.js",
   "type": "module",
@@ -18,7 +18,7 @@
     "@fastify/rate-limit": "10.1.0",
     "@fastify/compress": "7.0.1",
     "@fastify/swagger": "8.14.0",
-    "@fastify/swagger-ui": "3.0.3",
+    "@fastify/swagger-ui": "1.0.0",
     "fastify-metrics": "10.3.0",
     "fastify-raw-body": "4.3.0",
     "jsonwebtoken": "9.0.2",
