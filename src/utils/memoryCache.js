@@ -1,5 +1,6 @@
 // src/utils/memoryCache.js (ESM)
 
+// Capacitate maximă cache (500 chei)
 const MAX_KEYS = 500;
 const mem = new Map();
 
@@ -34,5 +35,5 @@ function del(key) {
 
 const cache = { get, set, del };
 
-export { get, set, del };   // dacă vrei să le imporți individual
-export default cache;       // pentru `import cache from ...`
+export { get, set, del };
+export default cache;
