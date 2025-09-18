@@ -1,10 +1,9 @@
-// src/utils/memoryCache.js
+// src/utils/memoryCache.js (ESM)
 
-// Cache simplu în memorie, se golește la restart
 const MAX_KEYS = 500;
 const mem = new Map();
 
-function now() { return Date.now(); }
+const now = () => Date.now();
 
 function pruneIfTooBig() {
   while (mem.size > MAX_KEYS) {
@@ -33,4 +32,7 @@ function del(key) {
   mem.delete(key);
 }
 
-module.exports = { get, set, del };
+const cache = { get, set, del };
+
+export { get, set, del };   // dacă vrei să le imporți individual
+export default cache;       // pentru `import cache from ...`
