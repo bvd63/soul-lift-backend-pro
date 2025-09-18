@@ -9,15 +9,15 @@
     "dev": "NODE_ENV=development node index.js"
   },
   "dependencies": {
-    "@fastify/compress": "^8.1.0",
-    "@fastify/cors": "^8.3.0",
-    "@fastify/helmet": "^11.1.1",
-    "@fastify/rate-limit": "^8.0.0",
-    "@fastify/swagger": "^8.14.0",
-    "@fastify/swagger-ui": "^1.10.2",
+    "@fastify/compress": "7.0.0",
+    "@fastify/cors": "8.2.1",
+    "@fastify/helmet": "10.1.1",
+    "@fastify/rate-limit": "7.7.0",
+    "@fastify/swagger": "8.10.0",
+    "@fastify/swagger-ui": "1.9.3",
     "bcryptjs": "^2.4.3",
-    "fastify": "^4.29.1",
-    "fastify-metrics": "^10.3.0",
+    "fastify": "4.29.1",
+    "fastify-metrics": "10.3.0",
     "jsonwebtoken": "^9.0.2",
     "node-cron": "^3.0.3",
     "node-fetch": "^3.3.2"
