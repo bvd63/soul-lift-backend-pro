@@ -1,4 +1,10 @@
-// index.js — SoulLift (Stripe subs + premium gating + auth + AI quotes + translations + automation + FCM v1 + Sentry)
+
+// index.js — SoulLift backend FINAL (Postgres + Stripe + OpenAI/DeepL + FCM v1 + Sentry + AI improvements)
+//
+// Notes:
+// - Requires environment variables set in Render: DATABASE_URL, FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL,
+//   FIREBASE_PRIVATE_KEY (with \n), OPENAI_API_KEY, DEEPL_API_KEY, STRIPE_*, JWT_SECRET, SENTRY_DSN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+// - Run migrate.sql once to create DB schema.
 
 import Fastify from "fastify";
 import cors from "@fastify/cors";
@@ -10,28 +16,26 @@ import swaggerUI from "@fastify/swagger-ui";
 import metrics from "fastify-metrics";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
-import fs from "fs";
 import fetch from "node-fetch";
 import cron from "node-cron";
 import Stripe from "stripe";
 import fastifyRawBody from "fastify-raw-body";
+import pg from "pg";
+import * as Sentry from "@sentry/node";
 
-import cache from "./src/utils/memoryCache.js";
-
-// ----------------- core setup
 const isProd = process.env.NODE_ENV === "production";
-const app = Fastify({ logger: { level: isProd ? "info" : "debug" }, bodyLimit: 32 * 1024 });
+const app = Fastify({ logger: { level: isProd ? "info" : "debug" }, bodyLimit: 64 * 1024 });
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "soul-lift-secret";
-
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
-const APP_BASE_URL = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
 
-// OpenAI / DeepL
+// External keys
 const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
 const DEEPL_KEY = process.env.DEEPL_API_KEY || "";
-const DEEPL_ENDPOINT = "https://api-free.deepl.com";
+const DEEPL_ENDPOINT = process.env.DEEPL_ENDPOINT || "https://api-free.deepl.com";
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
 // Stripe
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
@@ -39,592 +43,637 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const STRIPE_PRICE_ID_MONTHLY = process.env.STRIPE_PRICE_ID_MONTHLY || "";
 const STRIPE_PRICE_ID_YEARLY = process.env.STRIPE_PRICE_ID_YEARLY || "";
 
-// Observability (opțional)
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-
-// -------- FCM v1 (Service Account) --------
+// FCM v1
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "";
 const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL || "";
 const FIREBASE_PRIVATE_KEY = (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
 
-// -------- Retry + Circuit breaker --------
-const RETRY_MAX = 3;
-const RETRY_BASE_DELAY = 500;
-let CIRCUIT_OPEN_UNTIL = 0;
-async function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-function isCircuitOpen(){ return Date.now() < CIRCUIT_OPEN_UNTIL; }
-function tripCircuit(ms=15000){ CIRCUIT_OPEN_UNTIL = Date.now()+ms; app.log.warn(`⚡ Circuit open for ${ms}ms`); }
-async function fetchWithRetry(url, options={}, {max=RETRY_MAX, baseDelay=RETRY_BASE_DELAY, label="fetch"} = {}) {
-  if (isCircuitOpen()) throw new Error(`CircuitOpen: skipping ${label}`);
-  let lastErr;
-  for (let i=0;i<max;i++){
-    try {
-      const res = await fetch(url, options);
-      if (!res.ok) throw new Error(`${label} HTTP ${res.status}`);
-      return res;
-    } catch (err) {
-      lastErr = err;
-      const delay = baseDelay * Math.pow(2,i);
-      app.log.warn({ err: String(err) }, `Retry ${i+1}/${max} for ${label} in ${delay}ms`);
-      await sleep(delay);
-    }
-  }
-  tripCircuit();
-  throw lastErr;
+// Sentry
+if (process.env.SENTRY_DSN) {
+  Sentry.init({ dsn: process.env.SENTRY_DSN, tracesSampleRate: 0.05 });
+  app.log.info("Sentry initialized");
 }
 
-// ----------------- plugins
+// Postgres
+const { Pool } = pg;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_SSL ? { rejectUnauthorized: false } : undefined
+});
+async function query(q, params) {
+  const client = await pool.connect();
+  try { return await client.query(q, params); } finally { client.release(); }
+}
+
+// utils
+function now() { return new Date().toISOString(); }
+function normText(s) { return (s||"").toLowerCase().replace(/\s+/g," ").trim(); }
+async function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+// simple retry wrapper
+async function fetchWithRetry(url, opts={}, retries=3, base=400) {
+  for (let i=0;i<retries;i++){
+    try {
+      const res = await fetch(url, opts);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (e) {
+      if (i===retries-1) throw e;
+      await sleep(base * Math.pow(2,i));
+    }
+  }
+}
+
+// ----------------- plugins -----------------
 await app.register(cors, { origin: true, credentials: true });
 await app.register(helmet, { global: true, contentSecurityPolicy: false });
 await app.register(rateLimit, {
-  max: 120, timeWindow: 60_000, hook: "onSend",
+  max: 200, timeWindow: 60_000,
   keyGenerator: (req) => req.headers["x-forwarded-for"] || req.ip
 });
 await app.register(compress);
-await app.register(swagger, { openapi: { info: { title: "SoulLift API", version: "7.3.0" } } });
+await app.register(swagger, { openapi: { info: { title: "SoulLift API", version: "10.0.0" } } });
 await app.register(swaggerUI, { routePrefix: "/docs" });
 await app.register(metrics, { endpoint: "/metrics", defaultMetrics: { enabled: true } });
 await app.register(fastifyRawBody, { field: "rawBody", global: false, runFirst: true });
 
-// Sentry (opțional)
-let Sentry = null;
-if (process.env.SENTRY_DSN) {
-  try {
-    const mod = await import("@sentry/node");
-    Sentry = mod.default || mod;
-    Sentry.init({ dsn: process.env.SENTRY_DSN, tracesSampleRate: 0.05 });
-    app.log.info("Sentry initialized.");
-  } catch { app.log.warn("Sentry not available. Skipping."); }
-}
-
-// ----------------- in-memory stores
-const users = new Map();
-let stats = {
-  quotes: 0, translations: 0, logins: 0, registers: 0,
-  favorites: 0, playlistCreates: 0, shareViews: 0,
-  aiQuotesGenerated: 0, checkouts: 0, webhookEvents: 0
+// ----------------- schema sanity check (ensure tables exist) -----------------
+const ensureTables = async ()=>{
+  await query(`
+    create table if not exists users (
+      email text primary key,
+      password_hash text,
+      created_at timestamptz default now(),
+      badges jsonb default '[]',
+      streak int default 0,
+      last_login date,
+      subscription_status text default 'inactive',
+      subscription_tier text default 'free',
+      stripe_customer_id text,
+      stripe_sub_id text,
+      current_period_end bigint
+    );
+  `);
+  await query(`
+    create table if not exists favorites (
+      email text references users(email) on delete cascade,
+      quote_id text,
+      created_at timestamptz default now(),
+      primary key(email, quote_id)
+    );
+  `);
+  await query(`
+    create table if not exists push_tokens (
+      id bigserial primary key,
+      email text references users(email) on delete cascade,
+      token text not null unique,
+      created_at timestamptz default now()
+    );
+  `);
+  await query(`
+    create table if not exists ai_quotes (
+      id bigserial primary key,
+      text text not null,
+      tags jsonb default '[]',
+      score int default 0,
+      embedding jsonb,
+      created_at timestamptz default now()
+    );
+  `);
+  await query(`
+    create table if not exists audit_log (
+      id bigserial primary key,
+      ts timestamptz default now(),
+      type text,
+      email text,
+      meta jsonb
+    );
+  `);
 };
-const audit = [];
-const errorsBuffer = [];
-const MAX_AUDIT = 500, MAX_ERRORS = 200;
-function pushAudit(evt){ audit.push({ ts: Date.now(), ...evt }); if (audit.length>MAX_AUDIT) audit.shift(); }
-function pushErr(err){ errorsBuffer.push({ ts: Date.now(), err: String(err) }); if (errorsBuffer.length>MAX_ERRORS) errorsBuffer.shift(); }
-const refreshBlacklist = new Set();
-const pushTokens = new Map(); // email -> Set(tokens)
+await ensureTables();
 
-// ----------------- catalog / content
-const categories = JSON.parse(fs.readFileSync("./categories.json", "utf-8"));
-const QUOTES = [
-  { id: "q1", text: "Your future is created by what you do today, not tomorrow.", author: "Robert Kiyosaki", source: "Interview", year: 2001, premium: false },
-  { id: "q2", text: "Success is not for the lazy.", author: "Jim Rohn", source: "Seminar", year: 1985, premium: false },
-  { id: "q3", text: "Focus on progress, not perfection.", author: "Bill Gates", source: "Talk", year: 2010, premium: false },
-  { id: "q4", text: "Gratitude turns what we have into enough.", author: "Aesop", source: "Fables", year: -550, premium: true }
-];
-const PREMIUM_COLLECTIONS = [
-  { id: "stoicism", name: "Stoicism Starter", items: ["q4"] },
-  { id: "deep-focus", name: "Deep Focus", items: ["q2", "q3"] }
-];
-const SUPPORTED_LANGS = ["EN","RO","FR","DE","ES","IT","PT","RU","JA","ZH","NL","PL","TR"];
-
-// ----------------- AI moderation / quality
-async function isContentAllowed(text){
-  if (!OPENAI_KEY) return true;
-  try {
-    const res = await fetchWithRetry("https://api.openai.com/v1/moderations", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "omni-moderation-latest", input: text })
-    }, { label: "moderation" });
-    const data = await res.json();
-    return !data?.results?.[0]?.flagged;
-  } catch (e) { pushErr(e); return true; }
+// ----------------- audit helper -----------------
+async function pushAudit(type,email,meta){
+  try { await query(`insert into audit_log(type,email,meta) values($1,$2,$3)`,[type,email,meta?JSON.stringify(meta):null]); }
+  catch(e){ app.log.warn("audit error", e); }
 }
 
-// ----------------- AI Quotes
-let AI_QUOTES = [];
-const aiQuoteSet = new Set();
-const norm = (s)=> (s||"").toLowerCase().replace(/\s+/g," ").trim();
-
-async function generateAIQuote() {
-  if (!OPENAI_KEY) return null;
-  const body = {
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: "Generate a short motivational quote under 120 characters. Return ONLY the quote." },
-      { role: "user", content: "Give me one motivational quote." }
-    ],
-    temperature: 0.8, max_tokens: 60
-  };
-  try {
-    const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }, { label: "openai:ai-quote" });
-    const data = await res.json();
-    const q = data?.choices?.[0]?.message?.content?.trim() || null;
-    if (!q) return null;
-    if (!(await isContentAllowed(q))) return null;
-    return q;
-  } catch (e){ pushErr(e); return null; }
-}
-
-// queue simplă
-const taskQueue = [];
-let queueRunning = false;
-function enqueue(fn){ taskQueue.push(fn); runQueue(); }
-async function runQueue(){
-  if (queueRunning) return;
-  queueRunning = true;
-  while (taskQueue.length){
-    const t = taskQueue.shift();
-    try { await t(); } catch(e){ pushErr(e); }
-    await sleep(250);
-  }
-  queueRunning = false;
-}
-
-async function generateBatch(count = 10) {
-  const list = [];
-  for (let i = 0; i < count; i++) {
-    try {
-      const q = await generateAIQuote();
-      if (q) {
-        const key = norm(q);
-        if (!aiQuoteSet.has(key)) { aiQuoteSet.add(key); list.push({ text: q, createdAt: Date.now() }); }
-      }
-    } catch(e){ pushErr(e); }
-    await sleep(1200);
-  }
-  AI_QUOTES = list;
-  stats.aiQuotesGenerated += list.length;
-  return list;
-}
-
-// la pornire
-await generateBatch(10);
-
-// cron: AI quotes 06:00
-cron.schedule("0 6 * * *", async () => {
-  app.log.info("⏰ Cron: generating AI quotes...");
-  enqueue(async ()=>{ await generateBatch(10); });
-});
-
-// cron: daily digest 07:30
-cron.schedule("30 7 * * *", async () => {
-  try {
-    const lines = [];
-    lines.push(`🗓 ${new Date().toLocaleString()} — Daily Digest SoulLift`);
-    lines.push(`• Stats: quotes=${stats.quotes}, aiGen=${stats.aiQuotesGenerated}, logins=${stats.logins}, registers=${stats.registers}, webhooks=${stats.webhookEvents}`);
-    if (errorsBuffer.length) {
-      lines.push(`• Last errors (${Math.min(5, errorsBuffer.length)}):`);
-      errorsBuffer.slice(-5).forEach(e => lines.push(`   - ${new Date(e.ts).toISOString()}: ${e.err}`));
-    } else { lines.push(`• No errors in the last 24h 🎉`); }
-    const msg = lines.join("\n");
-    if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-      await fetchWithRetry(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg })
-      }, { label: "telegram:digest" });
-    }
-  } catch (e) { pushErr(e); }
-});
-
-// ----------------- auth helpers
-function generateToken(email, exp = "1h") { return jwt.sign({ email }, JWT_SECRET, { expiresIn: exp }); }
-function authMiddleware(req, rep, done) {
-  const auth = req.headers.authorization;
-  if (!auth) return rep.code(401).send({ error: "Missing Authorization header" });
-  const token = auth.split(" ")[1];
+// ----------------- auth helpers -----------------
+function generateToken(email, exp="1h"){ return jwt.sign({ email }, JWT_SECRET, { expiresIn: exp }); }
+function authMiddleware(req, rep, done){
+  const a = req.headers.authorization;
+  if(!a) return rep.code(401).send({ error: "Missing Authorization header" });
+  const token = a.split(" ")[1];
   try { req.user = jwt.verify(token, JWT_SECRET); done(); }
   catch { return rep.code(401).send({ error: "Invalid token" }); }
 }
-function todayStr() { return new Date().toISOString().slice(0, 10); }
-function updateStreakOnLogin(user) {
-  const last = user.lastLogin || null; const today = todayStr(); if (last === today) return;
-  if (!last) user.streak = 1; else {
-    const dPrev = new Date(new Date(last).getTime() + 24*3600*1000);
-    user.streak = dPrev.toISOString().slice(0,10) === today ? (user.streak||0)+1 : 1;
+function todayStr(){ return new Date().toISOString().slice(0,10); }
+async function updateStreakOnLogin(email){
+  const { rows } = await query(`select last_login, streak, badges from users where email=$1`,[email]);
+  const user = rows[0];
+  const last = user?.last_login ? user.last_login.toISOString().slice(0,10) : null;
+  const today = todayStr();
+  let streak = user?.streak || 0;
+  let badges = user?.badges || [];
+  if (last === today) return;
+  if (!last) streak = 1;
+  else {
+    const prev = new Date(new Date(last).getTime() + 24*3600*1000);
+    streak = (prev.toISOString().slice(0,10) === today) ? streak+1 : 1;
   }
-  user.lastLogin = today; user.badges ||= [];
-  if (user.streak === 3 && !user.badges.includes("Streak 3")) user.badges.push("Streak 3");
-  if (user.streak === 7 && !user.badges.includes("Streak 7")) user.badges.push("Streak 7");
-  if (user.streak === 14 && !user.badges.includes("Streak 14")) user.badges.push("Streak 14");
-}
-function getOrCreateUserByEmail(email) {
-  if (!users.has(email)) {
-    users.set(email, { email, passwordHash: null, createdAt: Date.now(), favorites: [], badges: [], streak: 0, lastLogin: null,
-      subscription: { status: "inactive", tier: "free", currentPeriodEnd: null, stripeCustomerId: null, stripeSubId: null } });
-  }
-  return users.get(email);
-}
-function requirePro(req, rep, done) {
-  if (!req.user?.email) return rep.code(401).send({ error: "Unauthorized" });
-  const user = users.get(req.user.email); if (!user) return rep.code(401).send({ error: "Unauthorized" });
-  const ok = user.subscription?.status === "active" && user.subscription?.tier === "pro";
-  if (!ok) return rep.code(402).send({ error: "Payment Required", hint: "Upgrade to Pro to access this content." });
-  done();
+  if (streak === 3 && !badges.includes("Streak 3")) badges.push("Streak 3");
+  if (streak === 7 && !badges.includes("Streak 7")) badges.push("Streak 7");
+  if (streak === 14 && !badges.includes("Streak 14")) badges.push("Streak 14");
+  await query(`update users set streak=$2, last_login=$3, badges=$4 where email=$1`,[email,streak,today,JSON.stringify(badges)]);
+  await pushAudit("login", email, { streak });
 }
 
-// ----------------- traduceri
-async function translateWithOpenAI(text, targetLang) {
-  if (!OPENAI_KEY) return null;
-  const body = { model: "gpt-4o-mini", messages: [
-    { role: "system", content: "Return ONLY the translated text." },
-    { role: "user", content: `Translate to ${targetLang}:\n${text}` }
-  ], temperature: 0.2 };
-  try {
-    const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
-      method: "POST", headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }, { label: "openai:translate" });
-    const data = await res.json();
-    return data?.choices?.[0]?.message?.content?.trim() || null;
-  } catch (e){ pushErr(e); return null; }
+// ----------------- content (static + premium) -----------------
+import fs from "fs";
+const categories = JSON.parse(fs.readFileSync("./categories.json","utf-8"));
+const QUOTES = [
+  { id: "q1", text: "Your future is created by what you do today, not tomorrow.", author: "Robert Kiyosaki", source:"Interview", year:2001, premium:false },
+  { id: "q2", text: "Success is not for the lazy.", author: "Jim Rohn", source:"Seminar", year:1985, premium:false },
+  { id: "q3", text: "Focus on progress, not perfection.", author: "Bill Gates", source:"Talk", year:2010, premium:false },
+  { id: "q4", text: "Gratitude turns what we have into enough.", author: "Aesop", source:"Fables", year:-550, premium:true }
+];
+const PREMIUM_COLLECTIONS = [
+  { id: "stoicism", name: "Stoicism Starter", items: ["q4"] },
+  { id: "deep-focus", name: "Deep Focus", items: ["q2","q3"] }
+];
+
+// ----------------- AI helpers: embedding, tagging, scoring -----------------
+async function openaiChat(messages, opts={}) {
+  if(!OPENAI_KEY) throw new Error("OPENAI_KEY missing");
+  const body = { model: opts.model||"gpt-4o-mini", messages, temperature: opts.temperature||0.5, max_tokens: opts.max_tokens||150 };
+  const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
+    method:"POST",
+    headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type":"application/json" },
+    body: JSON.stringify(body)
+  },3,400);
+  const data = await res.json(); return data?.choices?.[0]?.message?.content?.trim();
 }
-async function translateWithDeepL(text, targetLang) {
-  if (!DEEPL_KEY) return null;
-  try {
-    const params = new URLSearchParams({ auth_key: DEEPL_KEY, text, target_lang: String(targetLang||"EN").toUpperCase() });
-    const res = await fetchWithRetry(`${DEEPL_ENDPOINT}/v2/translate`, {
-      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: params
-    }, { label: "deepl:translate" });
-    const data = await res.json(); return data?.translations?.[0]?.text || null;
-  } catch (e){ pushErr(e); return null; }
+async function openaiEmbedding(text){
+  if(!OPENAI_KEY) return null;
+  const res = await fetchWithRetry("https://api.openai.com/v1/embeddings", {
+    method:"POST",
+    headers:{ Authorization:`Bearer ${OPENAI_KEY}`, "Content-Type":"application/json" },
+    body: JSON.stringify({ model:"text-embedding-3-small", input:text })
+  },3,400);
+  const data = await res.json();
+  return data?.data?.[0]?.embedding || null;
 }
-async function translateText(text, targetLang="EN") {
-  if (!text) return ""; let translated = null;
-  try { translated = await translateWithOpenAI(text, targetLang); } catch(e){ pushErr(e); }
-  if (!translated) { try { translated = await translateWithDeepL(text, targetLang); } catch(e){ pushErr(e); } }
-  if (translated && translated!==text) stats.translations++; return translated || text;
+function cosine(a,b){
+  if(!a||!b||a.length!==b.length) return 0;
+  let dp=0, na=0, nb=0;
+  for(let i=0;i<a.length;i++){ dp+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i]; }
+  return dp/ (Math.sqrt(na)*Math.sqrt(nb) + 1e-12);
 }
 
-// ----------------- routes: health & misc
-app.get("/healthz", async () => ({ ok: true, ts: Date.now() }));
-app.get("/health", async () => ({ ok: true, ts: Date.now() }));
-app.get("/api/languages", async () => ({ ok: true, languages: SUPPORTED_LANGS }));
-app.get("/config", async () => ({
-  ok: true,
-  env: { node: process.version, isProd,
-    features: {
-      stripe: Boolean(process.env.STRIPE_SECRET_KEY),
-      openai: Boolean(OPENAI_KEY),
-      deepl: Boolean(DEEPL_KEY),
-      telegramDigest: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
-      fcmV1: Boolean(FIREBASE_PROJECT_ID && FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY),
-      sentry: Boolean(process.env.SENTRY_DSN),
-      circuitOpen: isCircuitOpen()
+async function aiTagAndScore(text){
+  try{
+    // tags (comma separated)
+    const promptTag = [
+      { role:"system", content:"You are a classifier. Return a JSON array of short tags (no explanation)." },
+      { role:"user", content:`Tag this quote: "${text}"` }
+    ];
+    const tagsRaw = await openaiChat(promptTag, { temperature:0.2, max_tokens:50 });
+    let tags = [];
+    try { tags = JSON.parse(tagsRaw); if (!Array.isArray(tags)) tags = [String(tagsRaw)]; } catch { tags = tagsRaw.split(",").map(s=>s.trim()).filter(Boolean); }
+    // quality score 1-100
+    const promptScore = [
+      { role:"system", content:"You are a critic. Return ONLY a number from 1 to 100 representing quality/impact/originality." },
+      { role:"user", content:`Rate the quality (1-100) of the following short quote. Return only the integer: "${text}"` }
+    ];
+    const scoreRaw = await openaiChat(promptScore, { temperature:0.0, max_tokens:10 });
+    const score = parseInt((scoreRaw||"0").replace(/\D/g,""),10) || 0;
+    // embedding
+    const embedding = await openaiEmbedding(text).catch(()=>null);
+    return { tags, score, embedding };
+  }catch(e){
+    app.log.warn("aiTagAndScore error", e);
+    return { tags:[], score:0, embedding:null };
+  }
+}
+
+// ----------------- generate + dedup pipeline -----------------
+async function isDuplicateByEmbedding(candidateEmbedding){
+  if(!candidateEmbedding) return false;
+  const { rows } = await query(`select id, embedding from ai_quotes where embedding is not null`);
+  for(const r of rows){
+    try{
+      const emb = r.embedding;
+      const sim = cosine(candidateEmbedding, emb);
+      if(sim > 0.92) return true;
+    }catch{}
+  }
+  return false;
+}
+
+async function generateAndStoreSingle(){
+  const quote = await generateAIQuote().catch(()=>null);
+  if(!quote) return null;
+  const n = normText(quote);
+  // moderate via OpenAI moderation if available
+  let allowed = true;
+  try{
+    if(OPENAI_KEY){
+      const modRes = await fetchWithRetry("https://api.openai.com/v1/moderations", {
+        method:"POST", headers:{ Authorization:`Bearer ${OPENAI_KEY}`, "Content-Type":"application/json" },
+        body: JSON.stringify({ model:"omni-moderation-latest", input: quote })
+      });
+      const mod = await modRes.json();
+      allowed = !mod?.results?.[0]?.flagged;
     }
+  }catch(e){ app.log.warn("moderation fail", e); }
+  if(!allowed) return null;
+  const { tags, score, embedding } = await aiTagAndScore(quote);
+  if (embedding && await isDuplicateByEmbedding(embedding)) {
+    app.log.info("duplicate detected, skipping");
+    return null;
+  }
+  await query(`insert into ai_quotes(text,tags,score,embedding) values($1,$2,$3,$4)`,[quote,JSON.stringify(tags),score,JSON.stringify(embedding)]);
+  await pushAudit("ai:generated", null, { quote, tags, score });
+  return { text: quote, tags, score };
+}
+
+async function generateBatchStore(count=10){
+  for(let i=0;i<count;i++){
+    try{ await generateAndStoreSingle(); }catch(e){ app.log.warn("gen single err", e); }
+    await sleep(1200);
+  }
+}
+
+// initial fill
+(async ()=>{ try{ await generateBatchStore(10); }catch(e){ app.log.warn("initial ai gen", e); } })();
+
+// schedule daily at 06:00 Europe/Bucharest
+cron.schedule("0 6 * * *", async ()=>{ app.log.info("cron: ai quotes"); try{ await generateBatchStore(10); }catch(e){ app.log.warn(e); } }, { timezone: "Europe/Bucharest" });
+
+// ----------------- API routes -----------------
+
+// health & config
+app.get("/health", async ()=>({ ok:true, ts: Date.now() }));
+app.get("/healthz", async ()=>({ ok:true, ts: Date.now() }));
+app.get("/config", async ()=>({
+  ok:true,
+  features:{
+    openai: Boolean(OPENAI_KEY), deepl: Boolean(DEEPL_KEY),
+    fcm: Boolean(FIREBASE_PROJECT_ID && FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY),
+    sentry: Boolean(process.env.SENTRY_DSN)
   }
 }));
 
-// ----------------- auth routes
-app.post("/api/register", async (req, rep) => {
+// languages
+app.get("/api/languages", async ()=>({ ok:true, languages: ["EN","RO","FR","DE","ES","IT","PT","RU","JA","ZH","NL","PL","TR"] }));
+
+// auth
+app.post("/api/register", async (req,rep)=>{
   const { email, password } = req.body || {};
-  if (!email || !password) return rep.code(400).send({ error: "Email and password required." });
-  if (users.has(email)) return rep.code(409).send({ error: "User already exists." });
-  const passwordHash = await bcrypt.hash(password, 10);
-  const user = getOrCreateUserByEmail(email);
-  user.passwordHash = passwordHash;
-  stats.registers++; pushAudit({ type: "register", email });
-  const accessToken = generateToken(email, "1h");
-  const refreshToken = generateToken(email, "7d");
-  return { ok: true, user: safeUser(user), tokens: { accessToken, refreshToken } };
+  if(!email||!password) return rep.code(400).send({ error:"Email and password required." });
+  const { rows } = await query(`select * from users where email=$1`,[email]);
+  if(rows[0]) return rep.code(409).send({ error:"User exists" });
+  const hash = await bcrypt.hash(password, 10);
+  await query(`insert into users(email,password_hash,created_at) values($1,$2,now())`,[email,hash]);
+  await pushAudit("register", email, null);
+  const access = generateToken(email, "1h"), refresh = generateToken(email, "7d");
+  return { ok:true, user: { email }, tokens: { access, refresh } };
 });
 
-app.post("/api/login", { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } }, async (req, rep) => {
+app.post("/api/login", async (req,rep)=>{
   const { email, password } = req.body || {};
-  if (!email || !password) return rep.code(400).send({ error: "Email and password required." });
-  const user = users.get(email);
-  if (!user?.passwordHash) return rep.code(401).send({ error: "Invalid credentials." });
-  const ok = await bcrypt.compare(password, user.passwordHash);
-  if (!ok) return rep.code(401).send({ error: "Invalid credentials." });
-  updateStreakOnLogin(user);
-  stats.logins++; pushAudit({ type: "login", email });
-  const accessToken = generateToken(email, "1h");
-  const refreshToken = generateToken(email, "7d");
-  return { ok: true, user: safeUser(user), tokens: { accessToken, refreshToken } };
+  if(!email||!password) return rep.code(400).send({ error:"Email and password required." });
+  const { rows } = await query(`select * from users where email=$1`,[email]);
+  const user = rows[0];
+  if(!user || !user.password_hash) return rep.code(401).send({ error:"Invalid credentials." });
+  const ok = await bcrypt.compare(password, user.password_hash);
+  if(!ok) return rep.code(401).send({ error:"Invalid credentials." });
+  await updateStreakOnLogin(email);
+  await pushAudit("login", email, null);
+  const access = generateToken(email, "1h"), refresh = generateToken(email, "7d");
+  return { ok:true, user: { email, badges: user.badges || [] }, tokens: { access, refresh } };
 });
 
-app.post("/api/refresh", async (req, rep) => {
+app.post("/api/refresh", async (req,rep)=>{
   const { token } = req.body || {};
-  if (!token) return rep.code(400).send({ error: "Missing token." });
-  if (refreshBlacklist.has(token)) return rep.code(401).send({ error: "Token rotated. Please use the latest refresh token." });
+  if(!token) return rep.code(400).send({ error:"Missing token" });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    refreshBlacklist.add(token);
-    const accessToken = generateToken(payload.email, "1h");
-    const newRefresh = generateToken(payload.email, "7d");
-    return { ok: true, tokens: { accessToken, refreshToken: newRefresh } };
-  } catch { return rep.code(401).send({ error: "Invalid refresh token." }); }
+    const access = generateToken(payload.email, "1h");
+    return { ok:true, accessToken: access };
+  } catch { return rep.code(401).send({ error:"Invalid refresh token" }); }
 });
 
-function safeUser(user) { const { passwordHash, ...rest } = user; return rest; }
-
-// ----------------- content routes
-app.get("/api/categories", async () => ({ ok: true, categories }));
-
-app.get("/api/quote", async (req, rep) => {
-  const email = tryGetEmail(req);
-  const user = email ? users.get(email) : null;
-  const isPro = user && user.subscription?.status === "active" && user.subscription?.tier === "pro";
-  const pool = QUOTES.filter(q => isPro ? true : !q.premium);
-  const q = pool[Math.floor(Math.random() * pool.length)];
-  stats.quotes++; return { ok: true, quote: q };
+// categories & quotes
+app.get("/api/categories", async ()=>({ ok:true, categories }));
+app.get("/api/quote", async (req,rep)=>{
+  let email = null;
+  try { const a = req.headers.authorization; if(a) email = jwt.verify(a.split(" ")[1], JWT_SECRET).email; } catch {}
+  let isPro = false;
+  if(email){
+    const { rows } = await query(`select subscription_status from users where email=$1`,[email]);
+    isPro = rows[0]?.subscription_status === "active";
+  }
+  const pool = QUOTES.filter(q=> isPro ? true : !q.premium );
+  const q = pool[Math.floor(Math.random()*pool.length)];
+  await pushAudit("quote:served", email, { quoteId: q.id });
+  return { ok:true, quote: q };
 });
 
-app.get("/api/collections", async () => ({ ok: true, collections: PREMIUM_COLLECTIONS.map(c => ({ id: c.id, name: c.name, premium: true })) }));
-
-app.get("/api/collections/premium/:id", { preHandler: [authMiddleware, requirePro] }, async (req, rep) => {
-  const { id } = req.params;
-  const col = PREMIUM_COLLECTIONS.find(c => c.id === id);
-  if (!col) return rep.code(404).send({ error: "Collection not found" });
-  const items = QUOTES.filter(q => col.items.includes(q.id));
-  return { ok: true, id: col.id, name: col.name, items };
-});
-
-app.get("/api/search", async (req, rep) => {
-  const q = String(req.query?.q || "").toLowerCase().trim();
-  if (!q) return { ok: true, results: [] };
-  const results = QUOTES.filter(it =>
-    it.text.toLowerCase().includes(q) ||
-    it.author.toLowerCase().includes(q) ||
-    String(it.year).includes(q)
-  );
-  return { ok: true, results };
-});
+// ai exports & admin
+app.get("/api/ai/export", async ()=>{ const { rows } = await query(`select id,text,tags,score,created_at from ai_quotes order by created_at desc limit 200`); return { ok:true, quotes: rows }; });
 
 // favorites
-app.post("/api/favorites/toggle", { preHandler: [authMiddleware] }, async (req, rep) => {
+app.post("/api/favorites/toggle", { preHandler: [authMiddleware] }, async (req,rep)=>{
   const { quoteId } = req.body || {};
-  if (!quoteId) return rep.code(400).send({ error: "quoteId required" });
-  const user = users.get(req.user.email);
-  user.favorites ||= [];
-  const idx = user.favorites.indexOf(quoteId);
-  if (idx === -1) user.favorites.push(quoteId);
-  else user.favorites.splice(idx, 1);
-  stats.favorites++; pushAudit({ type: "favorite:toggle", email: req.user.email, quoteId });
-  return { ok: true, favorites: user.favorites };
+  if(!quoteId) return rep.code(400).send({ error:"quoteId required" });
+  const email = req.user.email;
+  // toggle
+  const { rows } = await query(`select * from favorites where email=$1 and quote_id=$2`,[email,quoteId]);
+  if(rows[0]) await query(`delete from favorites where email=$1 and quote_id=$2`,[email,quoteId]);
+  else await query(`insert into favorites(email,quote_id) values($1,$2)`,[email,quoteId]);
+  await pushAudit("favorite:toggle", email, { quoteId });
+  return { ok:true };
 });
-app.get("/api/favorites", { preHandler: [authMiddleware] }, async (req, rep) => {
-  const user = users.get(req.user.email);
-  const items = (user.favorites || []).map(id => QUOTES.find(q => q.id === id)).filter(Boolean);
-  return { ok: true, items };
-});
-
-// AI export
-app.get("/api/ai/export", async () => ({ ok: true, quotes: AI_QUOTES }));
+app.get("/api/favorites", { preHandler: [authMiddleware] }, async (req)=>{ const email=req.user.email; const { rows } = await query(`select quote_id from favorites where email=$1`,[email]); return { ok:true, items: rows.map(r=> QUOTES.find(q=>q.id===r.quote_id)).filter(Boolean) }; });
 
 // translate
-app.post("/api/translate", async (req, rep) => {
-  const { text, targetLang = "EN" } = req.body || {};
-  if (!text) return rep.code(400).send({ error: "text required" });
-  const translated = await translateText(text, targetLang);
-  return { ok: true, translated };
+app.post("/api/translate", async (req,rep)=>{
+  const { text, targetLang="EN" } = req.body || {};
+  if(!text) return rep.code(400).send({ error:"text required" });
+  const t = await translateText(text, targetLang);
+  await pushAudit("translate", null, { targetLang });
+  return { ok:true, translated: t };
 });
 
-// ----------------- Notificări (FCM v1)
-// token register
-app.post("/api/notify/register", { preHandler: [authMiddleware] }, async (req, rep) => {
-  const { token } = req.body || {};
-  if (!token) return rep.code(400).send({ error: "FCM token required" });
-  const set = pushTokens.get(req.user.email) || new Set();
-  set.add(token); pushTokens.set(req.user.email, set);
-  pushAudit({ type: "notify:register", email: req.user.email });
-  return { ok: true, count: set.size };
-});
-
-async function getGoogleAccessToken() {
-  if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
-    throw new Error("FCM v1 not configured");
-  }
-  const now = Math.floor(Date.now() / 1000);
-  const jwtHeader = { alg: "RS256", typ: "JWT" };
-  const jwtClaim = {
-    iss: FIREBASE_CLIENT_EMAIL, sub: FIREBASE_CLIENT_EMAIL,
-    aud: "https://oauth2.googleapis.com/token",
-    iat: now, exp: now + 3600,
-    scope: "https://www.googleapis.com/auth/firebase.messaging"
-  };
-  const assertion = jwt.sign(jwtClaim, FIREBASE_PRIVATE_KEY, { algorithm: "RS256", header: jwtHeader });
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion })
-  });
-  if (!res.ok) throw new Error(`oauth token failed: ${res.status}`);
-  const data = await res.json(); return data.access_token;
+// translation helper
+async function translateText(text, targetLang="EN"){
+  if(!text) return "";
+  // try OpenAI first
+  try{
+    if(OPENAI_KEY){
+      const body = { model:"gpt-4o-mini", messages:[
+        { role:"system", content:"Return ONLY the translated text." },
+        { role:"user", content: `Translate to ${targetLang}:\n${text}` }
+      ], temperature: 0.2 };
+      const r = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
+        method:"POST", headers:{ Authorization:`Bearer ${OPENAI_KEY}`, "Content-Type":"application/json" }, body: JSON.stringify(body)
+      });
+      const data = await r.json();
+      const guess = data?.choices?.[0]?.message?.content?.trim();
+      if(guess) return guess;
+    }
+  }catch(e){ app.log.warn("openai translate fail", e); }
+  // fallback DeepL
+  try{
+    if(DEEPL_KEY){
+      const params = new URLSearchParams({ auth_key: DEEPL_KEY, text, target_lang: targetLang.toUpperCase() });
+      const r = await fetchWithRetry(`${DEEPL_ENDPOINT}/v2/translate`, { method:"POST", headers:{ "Content-Type":"application/x-www-form-urlencoded" }, body: params });
+      const d = await r.json();
+      return d?.translations?.[0]?.text || text;
+    }
+  }catch(e){ app.log.warn("deepl fail", e); }
+  return text;
 }
 
-async function fcmSendV1(tokens = [], { title = "SoulLift", body = "Hello!", data = {} } = {}) {
-  const accessToken = await getGoogleAccessToken();
+// ----------------- Stripe billing -----------------
+app.post("/api/billing/checkout", { preHandler: [authMiddleware] }, async (req,rep)=>{
+  const { plan="monthly" } = req.body || {};
+  const priceId = plan==="yearly" ? STRIPE_PRICE_ID_YEARLY : STRIPE_PRICE_ID_MONTHLY;
+  if(!priceId) return rep.code(500).send({ error: "Price not configured." });
+  const email = req.user.email;
+  // create customer if not exists
+  let { rows } = await query(`select stripe_customer_id from users where email=$1`,[email]);
+  let customerId = rows[0]?.stripe_customer_id;
+  if(!customerId){
+    const customer = await stripe.customers.create({ email });
+    customerId = customer.id;
+    await query(`update users set stripe_customer_id=$2 where email=$1`,[email, customerId]);
+  }
+  const session = await stripe.checkout.sessions.create({
+    mode: "subscription",
+    customer: customerId,
+    line_items: [{ price: priceId, quantity: 1 }],
+    allow_promotion_codes: true,
+    success_url: `${FRONTEND_URL}/pro/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${FRONTEND_URL}/pro/cancel`,
+    billing_address_collection: "auto"
+  });
+  await pushAudit("checkout:create", email, { plan });
+  return { ok:true, url: session.url };
+});
+
+// portal
+app.get("/api/billing/portal", { preHandler:[authMiddleware] }, async (req)=>{
+  const { rows } = await query(`select stripe_customer_id from users where email=$1`,[req.user.email]);
+  const customerId = rows[0]?.stripe_customer_id;
+  if(!customerId) return { ok:false, error: "No Stripe customer" };
+  const portal = await stripe.billingPortal.sessions.create({ customer: customerId, return_url: `${FRONTEND_URL}/account` });
+  return { ok:true, url: portal.url };
+});
+
+// webhook
+app.route({ method:"POST", url:"/api/stripe/webhook", config:{ rawBody:true }, handler: async (req,rep)=>{
+  const sig = req.headers["stripe-signature"];
+  let event;
+  try{ event = stripe.webhooks.constructEvent(req.rawBody, sig, STRIPE_WEBHOOK_SECRET); }
+  catch(e){ app.log.error("stripe webhook invalid", e); return rep.code(400).send({ error: e.message }); }
+  // handle events
+  try{
+    if(event.type === "checkout.session.completed"){
+      const s = event.data.object;
+      const email = s.customer_email || s.customer_details?.email;
+      if(email) await query(`update users set subscription_status='active', subscription_tier='pro' where email=$1`,[email]);
+      await pushAudit("stripe:checkout.completed", email, { id: s.id });
+    } else if(event.type === "customer.subscription.updated" || event.type === "customer.subscription.created"){
+      const sub = event.data.object;
+      // try to map by customer id
+      const cust = sub.customer;
+      if(cust){
+        await query(`update users set subscription_tier=$2, subscription_status=$3, stripe_sub_id=$4, current_period_end=$5 where stripe_customer_id=$1`,[cust, sub?.items?.data?.[0]?.price?.nickname || null, sub.status, sub.id, sub.current_period_end*1000]);
+      }
+      await pushAudit("stripe:subscription.update", null, { status: sub.status });
+    } else if(event.type === "customer.subscription.deleted"){
+      const sub = event.data.object;
+      const cust = sub.customer;
+      if(cust) await query(`update users set subscription_status='canceled', subscription_tier='free' where stripe_customer_id=$1`,[cust]);
+      await pushAudit("stripe:subscription.deleted", null, { id: sub.id });
+    }
+  }catch(e){ app.log.error("stripe handle err", e); Sentry.captureException(e); }
+  return { received:true };
+}});
+
+// ----------------- push tokens (FCM v1) -----------------
+app.post("/api/notify/register", { preHandler:[authMiddleware] }, async (req,rep)=>{
+  const { token } = req.body || {};
+  if(!token) return rep.code(400).send({ error: "token required" });
+  await query(`insert into push_tokens(email,token) values($1,$2) on conflict(token) do update set email=EXCLUDED.email`,[req.user.email,token]);
+  await pushAudit("notify:register", req.user.email, null);
+  return { ok:true };
+});
+
+// send test
+app.post("/api/notify/test", { preHandler:[authMiddleware] }, async (req,rep)=>{
+  const { rows } = await query(`select token from push_tokens where email=$1`,[req.user.email]);
+  const tokens = rows.map(r=>r.token);
+  if(!tokens.length) return rep.code(400).send({ error: "No tokens" });
+  const sent = await fcmSendV1(tokens, { title:"SoulLift", body:"Test notification ✅", data:{ type:"test" } });
+  await pushAudit("notify:test", req.user.email, { sent });
+  return { ok:true, sent };
+});
+
+// broadcast (pro only)
+app.post("/api/notify/broadcast", async (req,rep)=>{
+  const { title="SoulLift", body="Hello!", proOnly=true } = req.body || {};
+  const { rows } = await query(`select email, token from push_tokens`);
+  const groups = {};
+  for(const r of rows){ groups[r.email] = groups[r.email] || []; groups[r.email].push(r.token); }
+  let total=0;
+  for(const email of Object.keys(groups)){
+    if(proOnly){
+      const { rows: urows } = await query(`select subscription_status from users where email=$1`,[email]);
+      if(urows[0]?.subscription_status !== "active") continue;
+    }
+    try{
+      total += await fcmSendV1(groups[email], { title, body, data:{ type:"broadcast" } });
+      await sleep(100);
+    }catch(e){ app.log.warn("broadcast err", e); }
+  }
+  await pushAudit("notify:broadcast", null, { total });
+  return { ok:true, sent: total };
+});
+
+// ----------------- fcm helpers -----------------
+import jwtLib from "jsonwebtoken"; // re-use jwt for service account assertions
+
+async function getGoogleAccessToken(){
+  if(!FIREBASE_PROJECT_ID||!FIREBASE_CLIENT_EMAIL||!FIREBASE_PRIVATE_KEY) throw new Error("FCM not configured");
+  const nowSec = Math.floor(Date.now()/1000);
+  const header = { alg:"RS256", typ:"JWT" };
+  const claim = { iss:FIREBASE_CLIENT_EMAIL, sub:FIREBASE_CLIENT_EMAIL, aud:"https://oauth2.googleapis.com/token", iat:nowSec, exp:nowSec+3600, scope:"https://www.googleapis.com/auth/firebase.messaging" };
+  const assertion = jwtLib.sign(claim, FIREBASE_PRIVATE_KEY, { algorithm:"RS256", header });
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method:"POST", headers:{ "Content-Type":"application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type:"urn:ietf:params:oauth:grant-type:jwt-bearer", assertion })
+  });
+  const data = await res.json();
+  if(!data.access_token) throw new Error("no access token");
+  return data.access_token;
+}
+async function fcmSendV1(tokens=[], { title="SoulLift", body="Hi", data={} } = {}) {
+  if(!tokens || !tokens.length) return 0;
+  const access = await getGoogleAccessToken();
   const url = `https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`;
-  let sent = 0;
-  for (const token of tokens) {
-    const payload = { message: {
-      token, notification: { title, body },
-      data: Object.fromEntries(Object.entries(data).map(([k,v]) => [String(k), String(v)]))
-    }};
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    if (r.ok) sent++;
-    else { const txt = await r.text().catch(()=> ""); pushErr(`fcm v1 send fail ${r.status}: ${txt}`); }
-    await sleep(100);
+  let sent=0;
+  for(const t of tokens){
+    const payload = { message: { token: t, notification: { title, body }, data: Object.fromEntries(Object.entries(data).map(([k,v])=>[String(k),String(v)])) } };
+    const r = await fetch(url, { method:"POST", headers:{ Authorization:`Bearer ${access}`, "Content-Type":"application/json" }, body: JSON.stringify(payload) });
+    if(r.ok) sent++;
+    else {
+      const txt = await r.text().catch(()=>"");
+      app.log.warn("fcm send failed", r.status, txt);
+    }
+    await sleep(50);
   }
   return sent;
 }
 
-app.post("/api/notify/test", { preHandler: [authMiddleware] }, async (req, rep) => {
-  const tokens = Array.from(pushTokens.get(req.user.email) || []);
-  if (!tokens.length) return rep.code(400).send({ error: "No tokens for user" });
-  try {
-    const sent = await fcmSendV1(tokens, { title: "SoulLift", body: "Test notification ✅", data: { type: "test", ts: Date.now() } });
-    return { ok: true, sent };
-  } catch (e) { pushErr(e); return rep.code(500).send({ error: "FCM v1 send failed" }); }
+// ----------------- AI-powered features: recommendations, dunning, winback -----------------
+
+// recommend by tags & favorites simple approach
+app.get("/api/recommendations", { preHandler:[authMiddleware] }, async (req)=>{
+  const email = req.user.email;
+  const favs = (await query(`select quote_id from favorites where email=$1`,[email])).rows.map(r=>r.quote_id);
+  // simple: recommend top ai_quotes by score that are not favorited
+  const { rows } = await query(`select id,text,tags,score from ai_quotes order by score desc limit 50`);
+  const recs = rows.filter(r=> !favs.includes(String(r.id))).slice(0,10);
+  return { ok:true, recommendations: recs };
 });
 
-app.post("/api/notify/broadcast", async (req, rep) => {
-  const { title="SoulLift", body="Hello!", proOnly=true } = req.body || {};
-  const batches = [];
-  for (const [email, set] of pushTokens.entries()) {
-    const user = users.get(email);
-    if (proOnly && !(user?.subscription?.status==="active" && user?.subscription?.tier==="pro")) continue;
-    const tokens = Array.from(set || []);
-    if (tokens.length) batches.push(tokens);
-  }
-  if (!batches.length) return { ok: true, sent: 0 };
-  let total = 0;
-  for (const tokens of batches) {
-    try { total += await fcmSendV1(tokens, { title, body, data: { type: "broadcast", ts: Date.now() } }); await sleep(200); }
-    catch(e){ pushErr(e); }
-  }
-  pushAudit({ type: "notify:broadcast", count: total });
-  return { ok: true, sent: total };
-});
-
-// ----------------- Stripe billing
-app.post("/api/billing/checkout", { preHandler: [authMiddleware] }, async (req, rep) => {
-  const { plan = "monthly", successPath = "/pro/success", cancelPath = "/pro/cancel" } = req.body || {};
-  const user = users.get(req.user.email);
-  if (!user) return rep.code(401).send({ error: "Unauthorized" });
-
-  const priceId = plan === "yearly" && STRIPE_PRICE_ID_YEARLY ? STRIPE_PRICE_ID_YEARLY : STRIPE_PRICE_ID_MONTHLY;
-  if (!priceId) return rep.code(500).send({ error: "Price not configured." });
-
-  let customerId = user.subscription?.stripeCustomerId;
-  if (!customerId) {
-    const customer = await stripe.customers.create({ email: user.email, metadata: { app: "SoulLift" } });
-    customerId = customer.id; user.subscription.stripeCustomerId = customerId;
-  }
-
-  const session = await stripe.checkout.sessions.create({
-    mode: "subscription", customer: customerId,
-    line_items: [{ price: priceId, quantity: 1 }],
-    allow_promotion_codes: true,
-    success_url: `${FRONTEND_URL}${successPath}?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${FRONTEND_URL}${cancelPath}`,
-    billing_address_collection: "auto"
-  });
-
-  stats.checkouts++; pushAudit({ type: "checkout:create", email: user.email, plan });
-  return { ok: true, url: session.url };
-});
-
-app.get("/api/billing/portal", { preHandler: [authMiddleware] }, async (req, rep) => {
-  const user = users.get(req.user.email);
-  if (!user?.subscription?.stripeCustomerId) return rep.code(400).send({ error: "No Stripe customer for this user." });
-  const portal = await stripe.billingPortal.sessions.create({ customer: user.subscription.stripeCustomerId, return_url: `${FRONTEND_URL}/account` });
-  return { ok: true, url: portal.url };
-});
-
-app.route({
-  method: "POST", url: "/api/stripe/webhook", config: { rawBody: true },
-  handler: async (req, rep) => {
-    const sig = req.headers["stripe-signature"];
-    let event;
-    try { event = stripe.webhooks.constructEvent(req.rawBody, sig, STRIPE_WEBHOOK_SECRET); }
-    catch (err) { app.log.error("Stripe webhook signature error", err); Sentry?.captureException?.(err); pushErr(err); return rep.code(400).send({ error: `Webhook Error: ${err.message}` }); }
-
-    stats.webhookEvents++;
-
-    switch (event.type) {
-      case "checkout.session.completed": {
-        const session = event.data.object;
-        const customerId = session.customer; const subId = session.subscription;
-        const user = findUserByCustomerOrEmail(customerId, session.customer_details?.email);
-        if (user) {
-          user.subscription.status = "active"; user.subscription.tier = "pro";
-          user.subscription.stripeCustomerId = customerId; user.subscription.stripeSubId = subId;
-          try { const sub = await stripe.subscriptions.retrieve(subId); if (sub?.current_period_end) user.subscription.currentPeriodEnd = sub.current_period_end * 1000; }
-          catch(e){ pushErr(e); }
-          app.log.info(`✅ Activated PRO for ${user.email}`); pushAudit({ type: "subscription:activated", email: user.email });
-        }
-        break;
+// dunning: notify users past_due once per day
+cron.schedule("15 8 * * *", async ()=>{
+  try{
+    const { rows } = await query(`select email from users where subscription_status='past_due'`);
+    for(const r of rows){
+      const text = `Hi — we couldn't process your payment. Please update your card here: ${FRONTEND_URL}/account`;
+      if(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: `Dunning: ${r.email}` }) });
       }
-      case "customer.subscription.updated":
-      case "customer.subscription.created": {
-        const sub = event.data.object;
-        const user = findUserByCustomer(sub.customer);
-        if (user) {
-          user.subscription.stripeSubId = sub.id;
-          user.subscription.currentPeriodEnd = (sub.current_period_end || 0) * 1000;
-          const statusMap = { active: "active", trialing: "active", past_due: "past_due", canceled: "canceled", unpaid: "past_due", incomplete: "inactive", incomplete_expired: "inactive" };
-          user.subscription.status = statusMap[sub.status] || "inactive";
-          user.subscription.tier = user.subscription.status === "active" ? "pro" : "free";
-          app.log.info(`🔄 Subscription update for ${user.email}: ${sub.status}`);
-          pushAudit({ type: "subscription:update", email: user.email, status: sub.status });
-        }
-        break;
-      }
-      case "customer.subscription.deleted": {
-        const sub = event.data.object;
-        const user = findUserByCustomer(sub.customer);
-        if (user) {
-          user.subscription.status = "canceled"; user.subscription.tier = "free";
-          user.subscription.currentPeriodEnd = null;
-          app.log.info(`🪪 Subscription canceled for ${user.email}`); pushAudit({ type: "subscription:canceled", email: user.email });
-        }
-        break;
-      }
-      default: app.log.debug(`Unhandled Stripe event: ${event.type}`);
+      // TODO: send email via provider
     }
-    return { received: true };
-  }
+  }catch(e){ app.log.warn("dunning err", e); }
+}, { timezone: "Europe/Bucharest" });
+
+// winback: users inactive >14 days
+cron.schedule("0 9 * * *", async ()=>{
+  try{
+    const cutoff = new Date(Date.now() - 14*24*3600*1000).toISOString().slice(0,10);
+    const { rows } = await query(`select email from users where (last_login is null or last_login < $1) and subscription_status!='pro'`,[cutoff]);
+    for(const r of rows){
+      const text = `We miss you! Here's 3 new quotes specially selected for you.`;
+      // send telegram admin or email; for now push to admin chat
+      if(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: `Winback candidate: ${r.email}` }) });
+      }
+    }
+  }catch(e){ app.log.warn("winback err", e); }
+}, { timezone: "Europe/Bucharest" });
+
+// daily digest of errors/stats to Telegram at 07:30
+cron.schedule("30 7 * * *", async ()=>{
+  try{
+    const statsRes = await query(`select count(*) filter (where created_at > now() - interval '24 hours') as recent_quotes from ai_quotes`);
+    const errors = (await query(`select ts, type, meta from audit_log order by ts desc limit 5`)).rows;
+    const lines = [];
+    lines.push(`Daily Digest — ${new Date().toLocaleString()}`);
+    lines.push(`New AI quotes (24h): ${statsRes.rows[0]?.recent_quotes || 0}`);
+    if(errors.length){
+      lines.push("Recent audit:");
+      errors.forEach(e=> lines.push(` - ${e.type} @ ${e.ts.toISOString()}`));
+    }
+    const msg = lines.join("\n");
+    if(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID){
+      await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg }) });
+    }
+  }catch(e){ app.log.warn("daily digest err", e); }
+}, { timezone: "Europe/Bucharest" });
+
+// ----------------- admin/test routes ----------------app.post("/admin/telegram/test", async (req,rep)=>{
+app.post("/admin/telegram/test", async (req,rep)=>{
+  const { text = "SoulLift test message" } = req.body || {};
+  if(!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return rep.code(400).send({ error:"Telegram not configured" });
+  const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text }) });
+  if(!r.ok) return rep.code(500).send({ error:"Telegram error" });
+  return { ok:true };
 });
 
-function findUserByCustomerOrEmail(customerId, email) {
-  for (const u of users.values()) if (u.subscription?.stripeCustomerId === customerId) return u;
-  if (email && users.has(email)) return users.get(email);
-  return null;
-}
-function findUserByCustomer(customerId) {
-  for (const u of users.values()) if (u.subscription?.stripeCustomerId === customerId) return u;
-  return null;
-}
-
-// ----------------- stats
-app.get("/api/stats", async () => ({ ok: true, stats, audit: audit.slice(-20) }));
-
-// ----------------- small helpers
-function tryGetEmail(req) {
-  try { const auth = req.headers.authorization; if (!auth) return null;
-    const token = auth.split(" ")[1]; const payload = jwt.verify(token, JWT_SECRET);
-    return payload.email || null; } catch { return null; }
-}
-
-// error handler
-app.setErrorHandler((err, req, rep) => {
-  pushErr(err); Sentry?.captureException?.(err);
-  app.log.error({ err }, "Unhandled error"); rep.code(500).send({ error: "Internal Server Error" });
+// ----------------- export/backup endpoint -----------------
+app.get("/admin/export/json", async (req,rep)=>{
+  try{
+    const users = await query(`select email, created_at, badges, streak, last_login, subscription_status, subscription_tier from users`);
+    const favs = await query(`select * from favorites`);
+    const aiq = await query(`select id,text,tags,score,created_at from ai_quotes`);
+    const payload = { users: users.rows, favorites: favs.rows, ai_quotes: aiq.rows, exported_at: new Date().toISOString() };
+    const path = `/tmp/soullift_export_${Date.now()}.json`;
+    await fs.promises.writeFile(path, JSON.stringify(payload, null, 2), "utf-8");
+    return { ok:true, path };
+  }catch(e){ app.log.error("export err", e); return rep.code(500).send({ error:"export failed" }); }
 });
 
-// ----------------- start
-try {
+// ----------------- simple stats route -----------------
+app.get("/api/stats", async ()=> {
+  const q1 = await query(`select count(*) as users from users`);
+  const q2 = await query(`select count(*) as ai_quotes from ai_quotes`);
+  const q3 = await query(`select count(*) as favorites from favorites`);
+  return { ok:true, stats: { users: q1.rows[0].users, ai_quotes: q2.rows[0].ai_quotes, favorites: q3.rows[0].favorites } };
+});
+
+// ----------------- start server -----------------
+try{
   await app.listen({ port: PORT, host: "0.0.0.0" });
   app.log.info(`SoulLift listening on :${PORT}`);
-} catch (err) {
-  pushErr(err); app.log.error(err); process.exit(1);
+}catch(e){
+  Sentry.captureException(e);
+  app.log.error(e);
+  process.exit(1);
 }
