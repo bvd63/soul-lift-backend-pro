@@ -1,0 +1,55 @@
+# render.yaml — SoulLift (backend Fastify + Stripe + AI + cron intern)
+# Compatibil cu index.js: /health, node-cron intern, raw-body Stripe, etc.
+
+services:
+  - type: web
+    name: soullift-backend
+    env: node
+    plan: starter            # poți începe cu "free", dar recomand "starter" pentru stabilitate
+    region: frankfurt        # alege regiunea dorită (ex: oregon, singapore)
+    branch: main
+    autoDeploy: true
+    pullRequestPreviewsEnabled: false
+
+    buildCommand: "npm ci"
+    startCommand: "node index.js"
+
+    # Health check se potrivește cu ruta din index.js (am alias /health și /healthz)
+    healthCheckPath: /health
+    healthCheckTimeout: 100
+
+    # Păstrăm Node 20 pentru compatibilitatea pachetelor
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      # URL-urile app & frontend (ajusteză după domeniile tale)
+      - key: APP_BASE_URL
+        value: "https://soullift-backend.onrender.com"
+      - key: FRONTEND_URL
+        value: "http://localhost:5173"
+
+      # --- SECRETE (setează-le în Dashboard → nu comite valori aici) ---
+      - key: JWT_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DEEPL_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_ID_MONTHLY
+        sync: false
+      - key: STRIPE_PRICE_ID_YEARLY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN    # pentru daily digest (opțional)
+        sync: false
+      - key: TELEGRAM_CHAT_ID      # pentru daily digest (opțional)
+        sync: false
+      - key: FCM_SERVER_KEY        # pentru notificări push (opțional)
+        sync: false
