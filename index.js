@@ -1,4 +1,4 @@
-// index.js — SoulLift (all-in-one, Stripe subs real + premium gating + auth + AI quotes + translations + automation + FCM v1)
+// index.js — SoulLift (Stripe subs + premium gating + auth + AI quotes + translations + automation + FCM v1 + Sentry)
 
 import Fastify from "fastify";
 import cors from "@fastify/cors";
@@ -20,10 +20,7 @@ import cache from "./src/utils/memoryCache.js";
 
 // ----------------- core setup
 const isProd = process.env.NODE_ENV === "production";
-const app = Fastify({
-  logger: { level: isProd ? "info" : "debug" },
-  bodyLimit: 32 * 1024
-});
+const app = Fastify({ logger: { level: isProd ? "info" : "debug" }, bodyLimit: 32 * 1024 });
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "soul-lift-secret";
@@ -46,12 +43,12 @@ const STRIPE_PRICE_ID_YEARLY = process.env.STRIPE_PRICE_ID_YEARLY || "";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
-// ------------- FCM v1 (Service Account) — NO legacy server key needed
+// -------- FCM v1 (Service Account) --------
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "";
 const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL || "";
 const FIREBASE_PRIVATE_KEY = (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
 
-// Retry + Circuit breaker
+// -------- Retry + Circuit breaker --------
 const RETRY_MAX = 3;
 const RETRY_BASE_DELAY = 500;
 let CIRCUIT_OPEN_UNTIL = 0;
@@ -81,15 +78,11 @@ async function fetchWithRetry(url, options={}, {max=RETRY_MAX, baseDelay=RETRY_B
 await app.register(cors, { origin: true, credentials: true });
 await app.register(helmet, { global: true, contentSecurityPolicy: false });
 await app.register(rateLimit, {
-  max: 120,
-  timeWindow: 60_000,
-  hook: "onSend",
+  max: 120, timeWindow: 60_000, hook: "onSend",
   keyGenerator: (req) => req.headers["x-forwarded-for"] || req.ip
 });
 await app.register(compress);
-await app.register(swagger, {
-  openapi: { info: { title: "SoulLift API", version: "7.3.0" } }
-});
+await app.register(swagger, { openapi: { info: { title: "SoulLift API", version: "7.3.0" } } });
 await app.register(swaggerUI, { routePrefix: "/docs" });
 await app.register(metrics, { endpoint: "/metrics", defaultMetrics: { enabled: true } });
 await app.register(fastifyRawBody, { field: "rawBody", global: false, runFirst: true });
@@ -102,9 +95,7 @@ if (process.env.SENTRY_DSN) {
     Sentry = mod.default || mod;
     Sentry.init({ dsn: process.env.SENTRY_DSN, tracesSampleRate: 0.05 });
     app.log.info("Sentry initialized.");
-  } catch {
-    app.log.warn("Sentry not available. Skipping.");
-  }
+  } catch { app.log.warn("Sentry not available. Skipping."); }
 }
 
 // ----------------- in-memory stores
@@ -201,10 +192,7 @@ async function generateBatch(count = 10) {
       const q = await generateAIQuote();
       if (q) {
         const key = norm(q);
-        if (!aiQuoteSet.has(key)) {
-          aiQuoteSet.add(key);
-          list.push({ text: q, createdAt: Date.now() });
-        }
+        if (!aiQuoteSet.has(key)) { aiQuoteSet.add(key); list.push({ text: q, createdAt: Date.now() }); }
       }
     } catch(e){ pushErr(e); }
     await sleep(1200);
@@ -232,14 +220,11 @@ cron.schedule("30 7 * * *", async () => {
     if (errorsBuffer.length) {
       lines.push(`• Last errors (${Math.min(5, errorsBuffer.length)}):`);
       errorsBuffer.slice(-5).forEach(e => lines.push(`   - ${new Date(e.ts).toISOString()}: ${e.err}`));
-    } else {
-      lines.push(`• No errors in the last 24h 🎉`);
-    }
+    } else { lines.push(`• No errors in the last 24h 🎉`); }
     const msg = lines.join("\n");
     if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
       await fetchWithRetry(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+        method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg })
       }, { label: "telegram:digest" });
     }
@@ -247,9 +232,7 @@ cron.schedule("30 7 * * *", async () => {
 });
 
 // ----------------- auth helpers
-function generateToken(email, exp = "1h") {
-  return jwt.sign({ email }, JWT_SECRET, { expiresIn: exp });
-}
+function generateToken(email, exp = "1h") { return jwt.sign({ email }, JWT_SECRET, { expiresIn: exp }); }
 function authMiddleware(req, rep, done) {
   const auth = req.headers.authorization;
   if (!auth) return rep.code(401).send({ error: "Missing Authorization header" });
@@ -259,37 +242,26 @@ function authMiddleware(req, rep, done) {
 }
 function todayStr() { return new Date().toISOString().slice(0, 10); }
 function updateStreakOnLogin(user) {
-  const last = user.lastLogin || null;
-  const today = todayStr();
-  if (last === today) return;
-  if (!last) user.streak = 1;
-  else {
+  const last = user.lastLogin || null; const today = todayStr(); if (last === today) return;
+  if (!last) user.streak = 1; else {
     const dPrev = new Date(new Date(last).getTime() + 24*3600*1000);
     user.streak = dPrev.toISOString().slice(0,10) === today ? (user.streak||0)+1 : 1;
   }
-  user.lastLogin = today;
-  user.badges ||= [];
+  user.lastLogin = today; user.badges ||= [];
   if (user.streak === 3 && !user.badges.includes("Streak 3")) user.badges.push("Streak 3");
   if (user.streak === 7 && !user.badges.includes("Streak 7")) user.badges.push("Streak 7");
   if (user.streak === 14 && !user.badges.includes("Streak 14")) user.badges.push("Streak 14");
 }
 function getOrCreateUserByEmail(email) {
   if (!users.has(email)) {
-    users.set(email, {
-      email, passwordHash: null, createdAt: Date.now(),
-      favorites: [], badges: [], streak: 0, lastLogin: null,
-      subscription: {
-        status: "inactive", tier: "free",
-        currentPeriodEnd: null, stripeCustomerId: null, stripeSubId: null
-      }
-    });
+    users.set(email, { email, passwordHash: null, createdAt: Date.now(), favorites: [], badges: [], streak: 0, lastLogin: null,
+      subscription: { status: "inactive", tier: "free", currentPeriodEnd: null, stripeCustomerId: null, stripeSubId: null } });
   }
   return users.get(email);
 }
 function requirePro(req, rep, done) {
   if (!req.user?.email) return rep.code(401).send({ error: "Unauthorized" });
-  const user = users.get(req.user.email);
-  if (!user) return rep.code(401).send({ error: "Unauthorized" });
+  const user = users.get(req.user.email); if (!user) return rep.code(401).send({ error: "Unauthorized" });
   const ok = user.subscription?.status === "active" && user.subscription?.tier === "pro";
   if (!ok) return rep.code(402).send({ error: "Payment Required", hint: "Upgrade to Pro to access this content." });
   done();
@@ -298,18 +270,13 @@ function requirePro(req, rep, done) {
 // ----------------- traduceri
 async function translateWithOpenAI(text, targetLang) {
   if (!OPENAI_KEY) return null;
-  const body = {
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: "Return ONLY the translated text." },
-      { role: "user", content: `Translate to ${targetLang}:\n${text}` }
-    ],
-    temperature: 0.2
-  };
+  const body = { model: "gpt-4o-mini", messages: [
+    { role: "system", content: "Return ONLY the translated text." },
+    { role: "user", content: `Translate to ${targetLang}:\n${text}` }
+  ], temperature: 0.2 };
   try {
     const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
+      method: "POST", headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify(body)
     }, { label: "openai:translate" });
     const data = await res.json();
@@ -321,21 +288,16 @@ async function translateWithDeepL(text, targetLang) {
   try {
     const params = new URLSearchParams({ auth_key: DEEPL_KEY, text, target_lang: String(targetLang||"EN").toUpperCase() });
     const res = await fetchWithRetry(`${DEEPL_ENDPOINT}/v2/translate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: params
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: params
     }, { label: "deepl:translate" });
-    const data = await res.json();
-    return data?.translations?.[0]?.text || null;
+    const data = await res.json(); return data?.translations?.[0]?.text || null;
   } catch (e){ pushErr(e); return null; }
 }
 async function translateText(text, targetLang="EN") {
-  if (!text) return "";
-  let translated = null;
+  if (!text) return ""; let translated = null;
   try { translated = await translateWithOpenAI(text, targetLang); } catch(e){ pushErr(e); }
   if (!translated) { try { translated = await translateWithDeepL(text, targetLang); } catch(e){ pushErr(e); } }
-  if (translated && translated!==text) stats.translations++;
-  return translated || text;
+  if (translated && translated!==text) stats.translations++; return translated || text;
 }
 
 // ----------------- routes: health & misc
@@ -344,8 +306,7 @@ app.get("/health", async () => ({ ok: true, ts: Date.now() }));
 app.get("/api/languages", async () => ({ ok: true, languages: SUPPORTED_LANGS }));
 app.get("/config", async () => ({
   ok: true,
-  env: {
-    node: process.version, isProd,
+  env: { node: process.version, isProd,
     features: {
       stripe: Boolean(process.env.STRIPE_SECRET_KEY),
       openai: Boolean(OPENAI_KEY),
@@ -372,9 +333,7 @@ app.post("/api/register", async (req, rep) => {
   return { ok: true, user: safeUser(user), tokens: { accessToken, refreshToken } };
 });
 
-app.post("/api/login", {
-  config: { rateLimit: { max: 5, timeWindow: "1 minute" } }
-}, async (req, rep) => {
+app.post("/api/login", { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } }, async (req, rep) => {
   const { email, password } = req.body || {};
   if (!email || !password) return rep.code(400).send({ error: "Email and password required." });
   const user = users.get(email);
@@ -398,15 +357,10 @@ app.post("/api/refresh", async (req, rep) => {
     const accessToken = generateToken(payload.email, "1h");
     const newRefresh = generateToken(payload.email, "7d");
     return { ok: true, tokens: { accessToken, refreshToken: newRefresh } };
-  } catch {
-    return rep.code(401).send({ error: "Invalid refresh token." });
-  }
+  } catch { return rep.code(401).send({ error: "Invalid refresh token." }); }
 });
 
-function safeUser(user) {
-  const { passwordHash, ...rest } = user;
-  return rest;
-}
+function safeUser(user) { const { passwordHash, ...rest } = user; return rest; }
 
 // ----------------- content routes
 app.get("/api/categories", async () => ({ ok: true, categories }));
@@ -417,13 +371,10 @@ app.get("/api/quote", async (req, rep) => {
   const isPro = user && user.subscription?.status === "active" && user.subscription?.tier === "pro";
   const pool = QUOTES.filter(q => isPro ? true : !q.premium);
   const q = pool[Math.floor(Math.random() * pool.length)];
-  stats.quotes++;
-  return { ok: true, quote: q };
+  stats.quotes++; return { ok: true, quote: q };
 });
 
-app.get("/api/collections", async () => {
-  return { ok: true, collections: PREMIUM_COLLECTIONS.map(c => ({ id: c.id, name: c.name, premium: true })) };
-});
+app.get("/api/collections", async () => ({ ok: true, collections: PREMIUM_COLLECTIONS.map(c => ({ id: c.id, name: c.name, premium: true })) }));
 
 app.get("/api/collections/premium/:id", { preHandler: [authMiddleware, requirePro] }, async (req, rep) => {
   const { id } = req.params;
@@ -479,13 +430,11 @@ app.post("/api/notify/register", { preHandler: [authMiddleware] }, async (req, r
   const { token } = req.body || {};
   if (!token) return rep.code(400).send({ error: "FCM token required" });
   const set = pushTokens.get(req.user.email) || new Set();
-  set.add(token);
-  pushTokens.set(req.user.email, set);
+  set.add(token); pushTokens.set(req.user.email, set);
   pushAudit({ type: "notify:register", email: req.user.email });
   return { ok: true, count: set.size };
 });
 
-// helper: access token pentru FCM v1
 async function getGoogleAccessToken() {
   if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
     throw new Error("FCM v1 not configured");
@@ -493,25 +442,18 @@ async function getGoogleAccessToken() {
   const now = Math.floor(Date.now() / 1000);
   const jwtHeader = { alg: "RS256", typ: "JWT" };
   const jwtClaim = {
-    iss: FIREBASE_CLIENT_EMAIL,
-    sub: FIREBASE_CLIENT_EMAIL,
+    iss: FIREBASE_CLIENT_EMAIL, sub: FIREBASE_CLIENT_EMAIL,
     aud: "https://oauth2.googleapis.com/token",
-    iat: now,
-    exp: now + 3600,
+    iat: now, exp: now + 3600,
     scope: "https://www.googleapis.com/auth/firebase.messaging"
   };
   const assertion = jwt.sign(jwtClaim, FIREBASE_PRIVATE_KEY, { algorithm: "RS256", header: jwtHeader });
   const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion
-    })
+    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion })
   });
   if (!res.ok) throw new Error(`oauth token failed: ${res.status}`);
-  const data = await res.json();
-  return data.access_token;
+  const data = await res.json(); return data.access_token;
 }
 
 async function fcmSendV1(tokens = [], { title = "SoulLift", body = "Hello!", data = {} } = {}) {
@@ -519,23 +461,17 @@ async function fcmSendV1(tokens = [], { title = "SoulLift", body = "Hello!", dat
   const url = `https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`;
   let sent = 0;
   for (const token of tokens) {
-    const payload = {
-      message: {
-        token,
-        notification: { title, body },
-        data: Object.fromEntries(Object.entries(data).map(([k,v]) => [String(k), String(v)]))
-      }
-    };
+    const payload = { message: {
+      token, notification: { title, body },
+      data: Object.fromEntries(Object.entries(data).map(([k,v]) => [String(k), String(v)]))
+    }};
     const r = await fetch(url, {
       method: "POST",
       headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
     if (r.ok) sent++;
-    else {
-      const txt = await r.text().catch(()=> "");
-      pushErr(`fcm v1 send fail ${r.status}: ${txt}`);
-    }
+    else { const txt = await r.text().catch(()=> ""); pushErr(`fcm v1 send fail ${r.status}: ${txt}`); }
     await sleep(100);
   }
   return sent;
@@ -581,13 +517,11 @@ app.post("/api/billing/checkout", { preHandler: [authMiddleware] }, async (req, 
   let customerId = user.subscription?.stripeCustomerId;
   if (!customerId) {
     const customer = await stripe.customers.create({ email: user.email, metadata: { app: "SoulLift" } });
-    customerId = customer.id;
-    user.subscription.stripeCustomerId = customerId;
+    customerId = customer.id; user.subscription.stripeCustomerId = customerId;
   }
 
   const session = await stripe.checkout.sessions.create({
-    mode: "subscription",
-    customer: customerId,
+    mode: "subscription", customer: customerId,
     line_items: [{ price: priceId, quantity: 1 }],
     allow_promotion_codes: true,
     success_url: `${FRONTEND_URL}${successPath}?session_id={CHECKOUT_SESSION_ID}`,
@@ -602,48 +536,31 @@ app.post("/api/billing/checkout", { preHandler: [authMiddleware] }, async (req, 
 app.get("/api/billing/portal", { preHandler: [authMiddleware] }, async (req, rep) => {
   const user = users.get(req.user.email);
   if (!user?.subscription?.stripeCustomerId) return rep.code(400).send({ error: "No Stripe customer for this user." });
-  const portal = await stripe.billingPortal.sessions.create({
-    customer: user.subscription.stripeCustomerId,
-    return_url: `${FRONTEND_URL}/account`
-  });
+  const portal = await stripe.billingPortal.sessions.create({ customer: user.subscription.stripeCustomerId, return_url: `${FRONTEND_URL}/account` });
   return { ok: true, url: portal.url };
 });
 
 app.route({
-  method: "POST",
-  url: "/api/stripe/webhook",
-  config: { rawBody: true },
+  method: "POST", url: "/api/stripe/webhook", config: { rawBody: true },
   handler: async (req, rep) => {
     const sig = req.headers["stripe-signature"];
     let event;
-    try {
-      event = stripe.webhooks.constructEvent(req.rawBody, sig, STRIPE_WEBHOOK_SECRET);
-    } catch (err) {
-      app.log.error("Stripe webhook signature error", err);
-      Sentry?.captureException?.(err);
-      pushErr(err);
-      return rep.code(400).send({ error: `Webhook Error: ${err.message}` });
-    }
+    try { event = stripe.webhooks.constructEvent(req.rawBody, sig, STRIPE_WEBHOOK_SECRET); }
+    catch (err) { app.log.error("Stripe webhook signature error", err); Sentry?.captureException?.(err); pushErr(err); return rep.code(400).send({ error: `Webhook Error: ${err.message}` }); }
 
     stats.webhookEvents++;
 
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object;
-        const customerId = session.customer;
-        const subId = session.subscription;
+        const customerId = session.customer; const subId = session.subscription;
         const user = findUserByCustomerOrEmail(customerId, session.customer_details?.email);
         if (user) {
-          user.subscription.status = "active";
-          user.subscription.tier = "pro";
-          user.subscription.stripeCustomerId = customerId;
-          user.subscription.stripeSubId = subId;
-          try {
-            const sub = await stripe.subscriptions.retrieve(subId);
-            if (sub?.current_period_end) user.subscription.currentPeriodEnd = sub.current_period_end * 1000;
-          } catch(e){ pushErr(e); }
-          app.log.info(`✅ Activated PRO for ${user.email}`);
-          pushAudit({ type: "subscription:activated", email: user.email });
+          user.subscription.status = "active"; user.subscription.tier = "pro";
+          user.subscription.stripeCustomerId = customerId; user.subscription.stripeSubId = subId;
+          try { const sub = await stripe.subscriptions.retrieve(subId); if (sub?.current_period_end) user.subscription.currentPeriodEnd = sub.current_period_end * 1000; }
+          catch(e){ pushErr(e); }
+          app.log.info(`✅ Activated PRO for ${user.email}`); pushAudit({ type: "subscription:activated", email: user.email });
         }
         break;
       }
@@ -654,11 +571,7 @@ app.route({
         if (user) {
           user.subscription.stripeSubId = sub.id;
           user.subscription.currentPeriodEnd = (sub.current_period_end || 0) * 1000;
-          const statusMap = {
-            active: "active", trialing: "active",
-            past_due: "past_due", canceled: "canceled", unpaid: "past_due",
-            incomplete: "inactive", incomplete_expired: "inactive"
-          };
+          const statusMap = { active: "active", trialing: "active", past_due: "past_due", canceled: "canceled", unpaid: "past_due", incomplete: "inactive", incomplete_expired: "inactive" };
           user.subscription.status = statusMap[sub.status] || "inactive";
           user.subscription.tier = user.subscription.status === "active" ? "pro" : "free";
           app.log.info(`🔄 Subscription update for ${user.email}: ${sub.status}`);
@@ -670,18 +583,14 @@ app.route({
         const sub = event.data.object;
         const user = findUserByCustomer(sub.customer);
         if (user) {
-          user.subscription.status = "canceled";
-          user.subscription.tier = "free";
+          user.subscription.status = "canceled"; user.subscription.tier = "free";
           user.subscription.currentPeriodEnd = null;
-          app.log.info(`🪪 Subscription canceled for ${user.email}`);
-          pushAudit({ type: "subscription:canceled", email: user.email });
+          app.log.info(`🪪 Subscription canceled for ${user.email}`); pushAudit({ type: "subscription:canceled", email: user.email });
         }
         break;
       }
-      default:
-        app.log.debug(`Unhandled Stripe event: ${event.type}`);
+      default: app.log.debug(`Unhandled Stripe event: ${event.type}`);
     }
-
     return { received: true };
   }
 });
@@ -701,21 +610,15 @@ app.get("/api/stats", async () => ({ ok: true, stats, audit: audit.slice(-20) })
 
 // ----------------- small helpers
 function tryGetEmail(req) {
-  try {
-    const auth = req.headers.authorization;
-    if (!auth) return null;
-    const token = auth.split(" ")[1];
-    const payload = jwt.verify(token, JWT_SECRET);
-    return payload.email || null;
-  } catch { return null; }
+  try { const auth = req.headers.authorization; if (!auth) return null;
+    const token = auth.split(" ")[1]; const payload = jwt.verify(token, JWT_SECRET);
+    return payload.email || null; } catch { return null; }
 }
 
 // error handler
 app.setErrorHandler((err, req, rep) => {
-  pushErr(err);
-  Sentry?.captureException?.(err);
-  app.log.error({ err }, "Unhandled error");
-  rep.code(500).send({ error: "Internal Server Error" });
+  pushErr(err); Sentry?.captureException?.(err);
+  app.log.error({ err }, "Unhandled error"); rep.code(500).send({ error: "Internal Server Error" });
 });
 
 // ----------------- start
@@ -723,7 +626,5 @@ try {
   await app.listen({ port: PORT, host: "0.0.0.0" });
   app.log.info(`SoulLift listening on :${PORT}`);
 } catch (err) {
-  pushErr(err);
-  app.log.error(err);
-  process.exit(1);
+  pushErr(err); app.log.error(err); process.exit(1);
 }
