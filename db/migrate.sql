@@ -70,6 +70,21 @@ create table if not exists audit_log (
 create index if not exists idx_audit_ts_desc on audit_log (ts desc);
 create index if not exists idx_audit_type on audit_log (type);
 
+-- ========== AUTH: REFRESH TOKENS ==========
+create table if not exists refresh_tokens (
+  id          bigserial primary key,
+  email       text references users(email) on delete cascade,
+  token       text not null unique,
+  issued_at   timestamptz default now(),
+  expires_at  timestamptz,
+  revoked_at  timestamptz
+);
+create index if not exists idx_refresh_email on refresh_tokens (email);
+create index if not exists idx_refresh_expires on refresh_tokens (expires_at);
+
+-- ========== EXTRA INDEXES ==========
+create index if not exists idx_favorites_created_at on favorites (created_at desc);
+
 -- ========== OPTIONAL: VIEW-uri simple pentru raportări ==========
 -- select * from audit_log where ts > now() - interval '24 hours' order by ts desc;
 -- select count(*) from ai_quotes where created_at > now() - interval '24 hours';
