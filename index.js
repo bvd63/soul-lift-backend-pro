@@ -481,6 +481,142 @@ app.get("/api/favorites", { preHandler: [authMiddleware] }, async (req) => {
   return { ok: true, items: rows.map(r => QUOTES.find(q => q.id === r.quote_id)).filter(Boolean) };
 });
 
+// search quotes (static + AI)
+app.get("/api/search", async (req, rep) => {
+  const { q, limit = 20, offset = 0 } = req.query || {};
+  if (!q || q.trim().length < 2) {
+    return rep.code(400).send({ error: "Query must be at least 2 characters" });
+  }
+
+  let email = null;
+  try { 
+    const a = req.headers.authorization; 
+    if (a) email = jwt.verify(a.split(" ")[1], JWT_SECRET).email; 
+  } catch {}
+  
+  let isPro = false;
+  if (email) {
+    const { rows } = await query(`select subscription_status from users where email=$1`, [email]);
+    isPro = rows[0]?.subscription_status === "active";
+  }
+
+  const searchTerm = q.trim().toLowerCase();
+  const results = [];
+
+  try {
+    // 1. Search static quotes
+    const staticMatches = QUOTES.filter(quote => {
+      // Skip premium quotes for non-pro users
+      if (quote.premium && !isPro) return false;
+      
+      const textMatch = quote.text.toLowerCase().includes(searchTerm);
+      const authorMatch = quote.author.toLowerCase().includes(searchTerm);
+      const sourceMatch = quote.source?.toLowerCase().includes(searchTerm);
+      
+      return textMatch || authorMatch || sourceMatch;
+    }).map(quote => ({
+      ...quote,
+      source_type: 'static',
+      relevance_score: calculateRelevanceScore(quote, searchTerm)
+    }));
+
+    results.push(...staticMatches);
+
+    // 2. Search AI quotes (PostgreSQL full-text search)
+    if (pool) {
+      const aiSearchQuery = `
+        SELECT id, text, tags, score, created_at,
+               ts_rank(to_tsvector('english', text), plainto_tsquery('english', $1)) as rank
+        FROM ai_quotes 
+        WHERE to_tsvector('english', text) @@ plainto_tsquery('english', $1)
+           OR text ILIKE $2
+           OR EXISTS (
+             SELECT 1 FROM jsonb_array_elements_text(tags) as tag 
+             WHERE tag ILIKE $2
+           )
+        ORDER BY rank DESC, score DESC
+        LIMIT $3 OFFSET $4
+      `;
+      
+      const { rows: aiQuotes } = await query(aiSearchQuery, [
+        searchTerm, 
+        `%${searchTerm}%`, 
+        parseInt(limit), 
+        parseInt(offset)
+      ]);
+
+      const aiMatches = aiQuotes.map(quote => ({
+        id: `ai_${quote.id}`,
+        text: quote.text,
+        author: "AI Generated",
+        source: "SoulLift AI",
+        year: new Date(quote.created_at).getFullYear(),
+        premium: false,
+        tags: quote.tags || [],
+        score: quote.score || 0,
+        source_type: 'ai',
+        relevance_score: quote.rank || 0,
+        created_at: quote.created_at
+      }));
+
+      results.push(...aiMatches);
+    }
+
+    // 3. Sort by relevance and apply pagination
+    const sortedResults = results
+      .sort((a, b) => b.relevance_score - a.relevance_score)
+      .slice(parseInt(offset), parseInt(offset) + parseInt(limit));
+
+    // 4. Log search audit
+    await pushAudit("search:query", email, { 
+      query: searchTerm, 
+      resultsCount: sortedResults.length,
+      isPro 
+    });
+
+    return { 
+      ok: true, 
+      results: sortedResults,
+      total: results.length,
+      query: searchTerm,
+      pagination: {
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+        hasMore: results.length > parseInt(offset) + parseInt(limit)
+      }
+    };
+
+  } catch (error) {
+    app.log.error("Search error:", error);
+    return rep.code(500).send({ error: "Search failed" });
+  }
+});
+
+// Helper function for relevance scoring
+function calculateRelevanceScore(quote, searchTerm) {
+  let score = 0;
+  const text = quote.text.toLowerCase();
+  const author = quote.author.toLowerCase();
+  const source = quote.source?.toLowerCase() || "";
+  
+  // Exact phrase match gets highest score
+  if (text.includes(searchTerm)) score += 10;
+  if (author.includes(searchTerm)) score += 8;
+  if (source.includes(searchTerm)) score += 5;
+  
+  // Word matches
+  const searchWords = searchTerm.split(' ');
+  searchWords.forEach(word => {
+    if (word.length > 2) {
+      if (text.includes(word)) score += 3;
+      if (author.includes(word)) score += 2;
+      if (source.includes(word)) score += 1;
+    }
+  });
+  
+  return score;
+}
+
 // translate
 app.post("/api/translate", async (req, rep) => {
   const { text, targetLang = "EN" } = req.body || {};
