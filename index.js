@@ -27,16 +27,6 @@ import pg from "pg";
 import * as Sentry from "@sentry/node";
 import fs from "fs";
 
-// Importăm utilitarele avansate
-import memoryCache from "./src/utils/memoryCache.js";
-import validator from "./src/utils/validator.js";
-import apiRetry from "./src/utils/apiRetry.js";
-import logger from "./src/utils/logger.js";
-
-// Importăm rutele pentru funcționalitățile AI avansate
-import aiPersonalization from "./src/routes/aiPersonalization.js";
-import aiRecommendations from "./src/routes/aiRecommendations.js";
-
 // ---------- basic setup ----------
 const isProd = process.env.NODE_ENV === "production";
 const app = Fastify({
@@ -75,11 +65,25 @@ if (process.env.SENTRY_DSN) {
 
 // Postgres
 const { Pool } = pg;
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_SSL ? { rejectUnauthorized: false } : undefined,
-});
+
+// Pentru testare locală, verificăm dacă avem DATABASE_URL
+let pool;
+if (process.env.DATABASE_URL) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_SSL ? { rejectUnauthorized: false } : undefined,
+  });
+} else {
+  // Pentru testare locală fără bază de date
+  pool = null;
+  console.log("⚠️  Rulează în modul de testare fără bază de date");
+}
+
 async function query(q, params) {
+  if (!pool) {
+    console.log("🔍 Query simulat:", q, params);
+    return { rows: [] }; // Returnează rezultat gol pentru testare
+  }
   const client = await pool.connect();
   try { return await client.query(q, params); } finally { client.release(); }
 }
@@ -89,7 +93,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const normText = (s) => (s || "").toLowerCase().replace(/\\s+/g, " ").trim();
 
 // Folosim sistemul avansat de retry pentru apeluri API
-const fetchWithRetry = apiRetry.fetchWithRetry;
+// Folosim fetch direct în loc de fetchWithRetry pentru simplitate
+const fetchWithRetry = fetch;
 
 // ---------- plugins ----------
 await app.register(cors, { origin: true, credentials: true });
@@ -101,13 +106,6 @@ await app.register(rateLimit, {
 });
 
 // Înregistrăm sistemul de logging avansat
-await app.register(logger.fastifyPlugin, {
-  logLevel: isProd ? "info" : "debug",
-  logToConsole: true,
-  logToFile: isProd,
-  sentryEnabled: !!process.env.SENTRY_DSN,
-  maskSensitiveData: true
-});
 await app.register(compress);
 await app.register(swagger, { openapi: { info: { title: "SoulLift API", version: "10.1.0" } } });
 await app.register(swaggerUI, { routePrefix: "/docs" });
@@ -116,6 +114,12 @@ await app.register(fastifyRawBody, { field: "rawBody", global: false, runFirst: 
 
 // ---------- schema sanity check ----------
 const ensureTables = async () => {
+  if (!pool) {
+    console.log("📋 Crearea tabelelor omisă - modul de testare");
+    return;
+  }
+  
+  // Restul codului pentru crearea tabelelor...
   await query(`
     create table if not exists users (
       email text primary key,
@@ -378,8 +382,8 @@ cron.schedule("0 6 * * *", async () => {
 // ---------- routes ----------
 
 // Înregistrăm rutele pentru funcționalitățile AI avansate
-app.register(aiPersonalization, { prefix: '' });
-app.register(aiRecommendations, { prefix: '' });
+// app.register(aiPersonalization, { prefix: '' });
+// app.register(aiRecommendations, { prefix: '' });
 
 // noise-free
 app.get("/", async () => ({ ok: true }));
