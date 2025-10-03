@@ -26,40 +26,66 @@ import fastifyRawBody from "fastify-raw-body";
 import pg from "pg";
 import * as Sentry from "@sentry/node";
 import fs from "fs";
+import dotenv from "dotenv";
+import { cleanEnv, str, bool, num } from "envalid";
 
 // ---------- basic setup ----------
-const isProd = process.env.NODE_ENV === "production";
+dotenv.config();
+const env = cleanEnv(process.env, {
+  NODE_ENV: str({ default: "development" }),
+  PORT: num({ default: 3000 }),
+  JWT_SECRET: str({ default: "soul-lift-secret" }),
+  FRONTEND_URL: str({ default: "http://localhost:5173" }),
+  USE_OPENAI: str({ default: "true" }),
+  OPENAI_API_KEY: str({ default: "" }),
+  DEEPL_API_KEY: str({ default: "" }),
+  DEEPL_ENDPOINT: str({ default: "https://api-free.deepl.com" }),
+  TELEGRAM_BOT_TOKEN: str({ default: "" }),
+  TELEGRAM_CHAT_ID: str({ default: "" }),
+  STRIPE_SECRET_KEY: str({ default: "" }),
+  STRIPE_WEBHOOK_SECRET: str({ default: "" }),
+  STRIPE_PRICE_ID_MONTHLY: str({ default: "" }),
+  STRIPE_PRICE_ID_YEARLY: str({ default: "" }),
+  FIREBASE_PROJECT_ID: str({ default: "" }),
+  FIREBASE_CLIENT_EMAIL: str({ default: "" }),
+  FIREBASE_PRIVATE_KEY: str({ default: "" }),
+  SENTRY_DSN: str({ default: "" }),
+  DATABASE_URL: str({ default: "" }),
+  DATABASE_SSL: bool({ default: false }),
+  CORS_ORIGINS: str({ default: "http://localhost:5173" })
+});
+const isProd = env.NODE_ENV === "production";
 const app = Fastify({
   logger: { level: isProd ? "info" : "debug" },
   bodyLimit: 64 * 1024,
 });
 
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || "soul-lift-secret";
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+const PORT = env.PORT;
+const JWT_SECRET = env.JWT_SECRET;
+const FRONTEND_URL = env.FRONTEND_URL;
 
 // Flags/keys
-const USE_OPENAI = (process.env.USE_OPENAI || "true").toLowerCase() !== "false";
-const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
-const DEEPL_KEY = process.env.DEEPL_API_KEY || "";
-const DEEPL_ENDPOINT = process.env.DEEPL_ENDPOINT || "https://api-free.deepl.com";
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+const USE_OPENAI = (env.USE_OPENAI || "true").toLowerCase() !== "false";
+const OPENAI_KEY = env.OPENAI_API_KEY || "";
+const DEEPL_KEY = env.DEEPL_API_KEY || "";
+const DEEPL_ENDPOINT = env.DEEPL_ENDPOINT || "https://api-free.deepl.com";
+const TELEGRAM_BOT_TOKEN = env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = env.TELEGRAM_CHAT_ID || "";
 
 // Stripe
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
-const STRIPE_PRICE_ID_MONTHLY = process.env.STRIPE_PRICE_ID_MONTHLY || "";
-const STRIPE_PRICE_ID_YEARLY = process.env.STRIPE_PRICE_ID_YEARLY || "";
+const stripe = new Stripe(env.STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
+const STRIPE_WEBHOOK_SECRET = env.STRIPE_WEBHOOK_SECRET || "";
+const STRIPE_PRICE_ID_MONTHLY = env.STRIPE_PRICE_ID_MONTHLY || "";
+const STRIPE_PRICE_ID_YEARLY = env.STRIPE_PRICE_ID_YEARLY || "";
 
 // FCM v1
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "";
-const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL || "";
-const FIREBASE_PRIVATE_KEY = (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+const FIREBASE_PROJECT_ID = env.FIREBASE_PROJECT_ID || "";
+const FIREBASE_CLIENT_EMAIL = env.FIREBASE_CLIENT_EMAIL || "";
+const FIREBASE_PRIVATE_KEY = (env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
 
 // Sentry
-if (process.env.SENTRY_DSN) {
-  Sentry.init({ dsn: process.env.SENTRY_DSN, tracesSampleRate: 0.05 });
+if (env.SENTRY_DSN) {
+  Sentry.init({ dsn: env.SENTRY_DSN, tracesSampleRate: 0.05 });
   app.log.info("Sentry initialized");
 }
 
@@ -68,10 +94,10 @@ const { Pool } = pg;
 
 // Pentru testare locală, verificăm dacă avem DATABASE_URL
 let pool;
-if (process.env.DATABASE_URL) {
+if (env.DATABASE_URL) {
   pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_SSL ? { rejectUnauthorized: false } : undefined,
+    connectionString: env.DATABASE_URL,
+    ssl: env.DATABASE_SSL ? { rejectUnauthorized: false } : undefined,
   });
 } else {
   // Pentru testare locală fără bază de date
@@ -97,13 +123,17 @@ const normText = (s) => (s || "").toLowerCase().replace(/\\s+/g, " ").trim();
 const fetchWithRetry = fetch;
 
 // ---------- plugins ----------
-await app.register(cors, { origin: true, credentials: true });
-await app.register(helmet, { global: true, contentSecurityPolicy: false });
-await app.register(rateLimit, {
-  max: 200,
-  timeWindow: 60_000,
-  keyGenerator: (req) => req.headers["x-forwarded-for"] || req.ip,
+const allowedOrigins = (env.CORS_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+await app.register(cors, {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, false);
+    const ok = allowedOrigins.includes(origin);
+    cb(null, ok);
+  },
+  credentials: true
 });
+await app.register(helmet, { global: true, contentSecurityPolicy: false });
+await app.register(rateLimit, { global: false });
 
 // Înregistrăm sistemul de logging avansat
 await app.register(compress);
@@ -111,6 +141,13 @@ await app.register(swagger, { openapi: { info: { title: "SoulLift API", version:
 await app.register(swaggerUI, { routePrefix: "/docs" });
 await app.register(metrics, { endpoint: "/metrics", defaultMetrics: { enabled: true } });
 await app.register(fastifyRawBody, { field: "rawBody", global: false, runFirst: true });
+// Global error handler
+app.setErrorHandler((err, req, rep) => {
+  app.log.error({ err }, "Unhandled error");
+  const status = err.statusCode || 500;
+  const code = err.code || "INTERNAL_ERROR";
+  rep.code(status).send({ error: "Internal error", code });
+});
 
 // ---------- schema sanity check ----------
 const ensureTables = async () => {
@@ -183,6 +220,30 @@ async function pushAudit(type, email, meta) {
 
 // ---------- auth helpers ----------
 function generateToken(email, exp = "1h") { return jwt.sign({ email }, JWT_SECRET, { expiresIn: exp }); }
+function generateRefreshToken(email, exp = "7d") { return jwt.sign({ email, type: "refresh" }, JWT_SECRET, { expiresIn: exp }); }
+async function storeRefreshToken(email, token, expiresDays = 7) {
+  if (!pool) return; // test mode without DB
+  const expiresAt = new Date(Date.now() + expiresDays * 24 * 3600 * 1000).toISOString();
+  await query(`insert into refresh_tokens(email, token, expires_at) values($1,$2,$3)`, [email, token, expiresAt]);
+}
+async function revokeRefreshToken(token) {
+  if (!pool) return;
+  await query(`update refresh_tokens set revoked_at = now() where token=$1`, [token]);
+}
+async function isRefreshTokenValid(token) {
+  if (!pool) {
+    try { const p = jwt.verify(token, JWT_SECRET); return p?.type === "refresh"; } catch { return false; }
+  }
+  const { rows } = await query(`select * from refresh_tokens where token=$1`, [token]);
+  const rt = rows[0];
+  if (!rt) return false;
+  if (rt.revoked_at) return false;
+  if (rt.expires_at && new Date(rt.expires_at).getTime() < Date.now()) return false;
+  try {
+    const p = jwt.verify(token, JWT_SECRET);
+    return p?.type === "refresh";
+  } catch { return false; }
+}
 function authMiddleware(req, rep, done) {
   const a = req.headers.authorization;
   if (!a) return rep.code(401).send({ error: "Missing Authorization header" });
@@ -219,6 +280,19 @@ try {
     categories = JSON.parse(fs.readFileSync("./categories.json", "utf-8"));
   }
 } catch { categories = []; }
+let categoriesETag = null;
+let categoriesLastMod = null;
+function computeCategoriesMeta() {
+  try {
+    const stat = fs.statSync("./categories.json");
+    categoriesLastMod = new Date(stat.mtime).toUTCString();
+    categoriesETag = `W/"${stat.size}-${Date.parse(stat.mtime)}"`;
+  } catch {
+    categoriesLastMod = new Date().toUTCString();
+    categoriesETag = `W/"mem-${categories.length}"`;
+  }
+}
+computeCategoriesMeta();
 
 const QUOTES = [
   { id: "q1", text: "Your future is created by what you do today, not tomorrow.", author: "Robert Kiyosaki", source: "Interview", year: 2001, premium: false },
@@ -414,12 +488,14 @@ app.post("/api/register", async (req, rep) => {
   const hash = await bcrypt.hash(password, 10);
   await query(`insert into users(email,password_hash,created_at) values($1,$2,now())`, [email, hash]);
   await pushAudit("register", email, null);
-  const access = generateToken(email, "1h"), refresh = generateToken(email, "7d");
+  const access = generateToken(email, "1h");
+  const refresh = generateRefreshToken(email, "7d");
+  await storeRefreshToken(email, refresh, 7);
   return { ok: true, user: { email }, tokens: { access, refresh } };
 });
 
-app.post("/api/login", async (req, rep) => {
-  const { email, password } = req.body || {};
+app.post("/api/login", { config: { rateLimit: { max: 10, timeWindow: '1m' } } }, async (req, rep) => {
+  const { email, password, remember = false } = req.body || {};
   if (!email || !password) return rep.code(400).send({ error: "Email and password required." });
   const { rows } = await query(`select * from users where email=$1`, [email]);
   const user = rows[0];
@@ -428,22 +504,55 @@ app.post("/api/login", async (req, rep) => {
   if (!ok) return rep.code(401).send({ error: "Invalid credentials." });
   await updateStreakOnLogin(email);
   await pushAudit("login", email, null);
-  const access = generateToken(email, "1h"), refresh = generateToken(email, "7d");
+  const access = generateToken(email, "1h");
+  const refreshDays = remember ? 30 : 7;
+  const refresh = generateRefreshToken(email, `${refreshDays}d`);
+  await storeRefreshToken(email, refresh, refreshDays);
   return { ok: true, user: { email, badges: user.badges || [] }, tokens: { access, refresh } };
 });
 
-app.post("/api/refresh", async (req, rep) => {
+app.post("/api/refresh", { config: { rateLimit: { max: 20, timeWindow: '1m' } } }, async (req, rep) => {
   const { token } = req.body || {};
   if (!token) return rep.code(400).send({ error: "Missing token" });
+  const valid = await isRefreshTokenValid(token);
+  if (!valid) return rep.code(401).send({ error: "Invalid refresh token" });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     const access = generateToken(payload.email, "1h");
-    return { ok: true, accessToken: access };
+    const newRefresh = generateRefreshToken(payload.email, "7d");
+    await storeRefreshToken(payload.email, newRefresh, 7);
+    await revokeRefreshToken(token);
+    return { ok: true, accessToken: access, refreshToken: newRefresh };
   } catch { return rep.code(401).send({ error: "Invalid refresh token" }); }
 });
 
 // categories & quotes
-app.get("/api/categories", async () => ({ ok: true, categories }));
+app.get("/api/categories", async (req, rep) => {
+  // Conditional GET using ETag and Last-Modified
+  const inm = req.headers["if-none-match"];
+  const ims = req.headers["if-modified-since"];
+
+  if (categoriesETag && inm === categoriesETag) {
+    rep.header("ETag", categoriesETag);
+    if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
+    rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
+    return rep.code(304).send();
+  }
+  if (categoriesLastMod && ims) {
+    const since = new Date(ims).getTime();
+    if (!Number.isNaN(since) && since >= categoriesLastMod) {
+      if (categoriesETag) rep.header("ETag", categoriesETag);
+      rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
+      rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
+      return rep.code(304).send();
+    }
+  }
+
+  if (categoriesETag) rep.header("ETag", categoriesETag);
+  if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
+  rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
+  return { ok: true, categories };
+});
 app.get("/api/quote", async (req, rep) => {
   let email = null;
   try { const a = req.headers.authorization; if (a) email = jwt.verify(a.split(" ")[1], JWT_SECRET).email; } catch {}
@@ -946,6 +1055,44 @@ cron.schedule("0 9 * * *", async () => {
       }
     }
   } catch (e) { app.log.warn("winback err", e); }
+}, { timezone: "Europe/Bucharest" });
+
+// Daily Stripe reconciliation: ensure DB reflects actual subscription status
+cron.schedule("0 2 * * *", async () => {
+  if (!pool || !env.STRIPE_SECRET_KEY) return;
+  try {
+    const { rows } = await query("select email, stripe_customer_id from users where stripe_customer_id is not null");
+    for (const u of rows) {
+      try {
+        const subs = await stripe.subscriptions.list({ customer: u.stripe_customer_id, status: 'all', limit: 1 });
+        const sub = subs?.data?.[0];
+        if (sub) {
+          await query(
+            `update users set subscription_tier=$2, subscription_status=$3, stripe_sub_id=$4, current_period_end=$5 where stripe_customer_id=$1`,
+            [
+              u.stripe_customer_id,
+              sub?.items?.data?.[0]?.price?.nickname || null,
+              sub.status,
+              sub.id,
+              (sub.current_period_end || 0) * 1000
+            ]
+          );
+          await pushAudit("stripe:reconcile", u.email, { status: sub.status, subId: sub.id });
+        } else {
+          await query(
+            `update users set subscription_status='canceled', subscription_tier='free', stripe_sub_id=null where stripe_customer_id=$1`,
+            [u.stripe_customer_id]
+          );
+          await pushAudit("stripe:reconcile:none", u.email, {});
+        }
+      } catch (e) {
+        app.log.warn("stripe reconcile user failed", e);
+      }
+    }
+  } catch (e) {
+    app.log.error("stripe reconcile error", e);
+    Sentry.captureException(e);
+  }
 }, { timezone: "Europe/Bucharest" });
 
 cron.schedule("30 7 * * *", async () => {
