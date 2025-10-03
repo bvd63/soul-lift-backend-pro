@@ -14,7 +14,6 @@
 
 // Importuri necesare
 import fetch from 'node-fetch';
-import { AbortController } from 'node-fetch/externals';
 import memoryCache from './memoryCache.js';
 
 // Configurare implicită
