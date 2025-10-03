@@ -25,7 +25,10 @@
     "node-cron": "3.0.3",
     "stripe": "16.6.0",
     "pg": "8.12.0",
-    "@sentry/node": "7.120.3"
+    "@sentry/node": "7.120.3",
+    "winston": "3.11.0",
+    "winston-daily-rotate-file": "4.7.1",
+    "joi": "17.11.0"
   },
   "overrides": { "undici": "6.18.1" }
 }
