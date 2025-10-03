@@ -52,6 +52,12 @@ create table if not exists ai_quotes (
 create index if not exists idx_ai_quotes_score_desc on ai_quotes (score desc);
 create index if not exists idx_ai_quotes_created_at on ai_quotes (created_at desc);
 
+-- ========== FULL-TEXT SEARCH INDEXES ==========
+-- GIN index pentru full-text search performant
+CREATE INDEX IF NOT EXISTS ai_quotes_fts_idx ON ai_quotes USING GIN (to_tsvector('english', text));
+-- GIN index pentru căutare în tags (JSONB)
+CREATE INDEX IF NOT EXISTS ai_quotes_tags_gin ON ai_quotes USING GIN ((tags));
+
 -- ========== AUDIT LOG ==========
 create table if not exists audit_log (
   id    bigserial primary key,
