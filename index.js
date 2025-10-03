@@ -481,10 +481,37 @@ app.get("/api/favorites", { preHandler: [authMiddleware] }, async (req) => {
   return { ok: true, items: rows.map(r => QUOTES.find(q => q.id === r.quote_id)).filter(Boolean) };
 });
 
-// search quotes (static + AI)
-app.get("/api/search", async (req, rep) => {
+// search quotes (static + AI) - Production Grade
+app.get("/api/search", {
+  schema: {
+    querystring: {
+      type: 'object',
+      properties: {
+        q: { type: 'string', minLength: 2, maxLength: 128 },
+        limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
+        offset: { type: 'integer', minimum: 0, default: 0 }
+      },
+      required: ['q']
+    },
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          results: { type: 'array' },
+          total: { type: 'integer' },
+          query: { type: 'string' },
+          pagination: { type: 'object' }
+        }
+      }
+    }
+  }
+}, async (req, rep) => {
   const { q, limit = 20, offset = 0 } = req.query || {};
-  if (!q || q.trim().length < 2) {
+  
+  // Input validation & normalization
+  const searchTerm = normalizeSearchTerm(q);
+  if (!searchTerm || searchTerm.length < 2) {
     return rep.code(400).send({ error: "Query must be at least 2 characters" });
   }
 
@@ -500,49 +527,42 @@ app.get("/api/search", async (req, rep) => {
     isPro = rows[0]?.subscription_status === "active";
   }
 
-  const searchTerm = q.trim().toLowerCase();
-  const results = [];
-
   try {
+    // Collect all results for proper global pagination
+    const allResults = [];
+
     // 1. Search static quotes
     const staticMatches = QUOTES.filter(quote => {
-      // Skip premium quotes for non-pro users
       if (quote.premium && !isPro) return false;
-      
-      const textMatch = quote.text.toLowerCase().includes(searchTerm);
-      const authorMatch = quote.author.toLowerCase().includes(searchTerm);
-      const sourceMatch = quote.source?.toLowerCase().includes(searchTerm);
-      
-      return textMatch || authorMatch || sourceMatch;
+      return matchesQuery(quote, searchTerm);
     }).map(quote => ({
       ...quote,
       source_type: 'static',
-      relevance_score: calculateRelevanceScore(quote, searchTerm)
+      relevance_score: calculateNormalizedScore(quote, searchTerm, 'static'),
+      matched_fields: getMatchedFields(quote, searchTerm),
+      highlights: generateHighlights(quote.text, searchTerm)
     }));
 
-    results.push(...staticMatches);
+    allResults.push(...staticMatches);
 
-    // 2. Search AI quotes (PostgreSQL full-text search)
+    // 2. Search AI quotes with websearch_to_tsquery
     if (pool) {
       const aiSearchQuery = `
         SELECT id, text, tags, score, created_at,
-               ts_rank(to_tsvector('english', text), plainto_tsquery('english', $1)) as rank
+               ts_rank(to_tsvector('english', text), websearch_to_tsquery('english', $1)) as rank,
+               ts_headline('english', text, websearch_to_tsquery('english', $1), 
+                          'MaxWords=20, MinWords=5, ShortWord=3, HighlightAll=false, MaxFragments=2') as headline
         FROM ai_quotes 
-        WHERE to_tsvector('english', text) @@ plainto_tsquery('english', $1)
+        WHERE to_tsvector('english', text) @@ websearch_to_tsquery('english', $1)
            OR text ILIKE $2
-           OR EXISTS (
-             SELECT 1 FROM jsonb_array_elements_text(tags) as tag 
-             WHERE tag ILIKE $2
-           )
+           OR tags @> $3::jsonb
         ORDER BY rank DESC, score DESC
-        LIMIT $3 OFFSET $4
       `;
       
       const { rows: aiQuotes } = await query(aiSearchQuery, [
         searchTerm, 
-        `%${searchTerm}%`, 
-        parseInt(limit), 
-        parseInt(offset)
+        `%${searchTerm}%`,
+        JSON.stringify([searchTerm])
       ]);
 
       const aiMatches = aiQuotes.map(quote => ({
@@ -555,34 +575,40 @@ app.get("/api/search", async (req, rep) => {
         tags: quote.tags || [],
         score: quote.score || 0,
         source_type: 'ai',
-        relevance_score: quote.rank || 0,
+        relevance_score: calculateNormalizedScore(quote, searchTerm, 'ai', quote.rank),
+        matched_fields: getMatchedFields(quote, searchTerm),
+        highlights: quote.headline || generateHighlights(quote.text, searchTerm),
         created_at: quote.created_at
       }));
 
-      results.push(...aiMatches);
+      allResults.push(...aiMatches);
     }
 
-    // 3. Sort by relevance and apply pagination
-    const sortedResults = results
+    // 3. Remove duplicates
+    const deduplicatedResults = removeDuplicates(allResults);
+
+    // 4. Sort by normalized relevance score and apply global pagination
+    const sortedResults = deduplicatedResults
       .sort((a, b) => b.relevance_score - a.relevance_score)
       .slice(parseInt(offset), parseInt(offset) + parseInt(limit));
 
-    // 4. Log search audit
+    // 5. Log search audit
     await pushAudit("search:query", email, { 
       query: searchTerm, 
       resultsCount: sortedResults.length,
+      totalFound: deduplicatedResults.length,
       isPro 
     });
 
     return { 
       ok: true, 
       results: sortedResults,
-      total: results.length,
+      total: deduplicatedResults.length,
       query: searchTerm,
       pagination: {
         limit: parseInt(limit),
         offset: parseInt(offset),
-        hasMore: results.length > parseInt(offset) + parseInt(limit)
+        hasMore: deduplicatedResults.length > parseInt(offset) + parseInt(limit)
       }
     };
 
@@ -592,29 +618,108 @@ app.get("/api/search", async (req, rep) => {
   }
 });
 
-// Helper function for relevance scoring
-function calculateRelevanceScore(quote, searchTerm) {
-  let score = 0;
+// Helper functions for enhanced search
+function normalizeSearchTerm(term) {
+  if (!term) return '';
+  return term.trim()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // Remove diacritics
+    .toLowerCase()
+    .substring(0, 128);
+}
+
+function matchesQuery(quote, searchTerm) {
   const text = quote.text.toLowerCase();
   const author = quote.author.toLowerCase();
   const source = quote.source?.toLowerCase() || "";
   
-  // Exact phrase match gets highest score
-  if (text.includes(searchTerm)) score += 10;
-  if (author.includes(searchTerm)) score += 8;
-  if (source.includes(searchTerm)) score += 5;
+  return text.includes(searchTerm) || 
+         author.includes(searchTerm) || 
+         source.includes(searchTerm);
+}
+
+function calculateNormalizedScore(quote, searchTerm, sourceType, dbRank = 0) {
+  let score = 0;
   
-  // Word matches
-  const searchWords = searchTerm.split(' ');
-  searchWords.forEach(word => {
-    if (word.length > 2) {
-      if (text.includes(word)) score += 3;
-      if (author.includes(word)) score += 2;
-      if (source.includes(word)) score += 1;
-    }
-  });
+  if (sourceType === 'ai' && dbRank) {
+    // Use PostgreSQL ts_rank as base (0-1 range typically)
+    score = Math.min(dbRank, 1.0);
+  } else {
+    // Calculate score for static quotes
+    const text = quote.text.toLowerCase();
+    const author = quote.author.toLowerCase();
+    const source = quote.source?.toLowerCase() || "";
+    
+    // Exact phrase match
+    if (text.includes(searchTerm)) score += 0.4;
+    if (author.includes(searchTerm)) score += 0.3;
+    if (source.includes(searchTerm)) score += 0.2;
+    
+    // Word boundary matches (higher relevance)
+    const wordBoundaryRegex = new RegExp(`\\b${searchTerm}\\b`, 'i');
+    if (wordBoundaryRegex.test(quote.text)) score += 0.3;
+    if (wordBoundaryRegex.test(quote.author)) score += 0.2;
+    
+    // Beginning of text match
+    if (text.startsWith(searchTerm)) score += 0.2;
+    
+    // Normalize to 0-1 range
+    score = Math.min(score, 1.0);
+  }
   
   return score;
+}
+
+function getMatchedFields(quote, searchTerm) {
+  const matched = [];
+  const text = quote.text?.toLowerCase() || '';
+  const author = quote.author?.toLowerCase() || '';
+  const source = quote.source?.toLowerCase() || '';
+  
+  if (text.includes(searchTerm)) matched.push('text');
+  if (author.includes(searchTerm)) matched.push('author');
+  if (source.includes(searchTerm)) matched.push('source');
+  if (quote.tags && Array.isArray(quote.tags)) {
+    const hasTagMatch = quote.tags.some(tag => 
+      tag.toLowerCase().includes(searchTerm)
+    );
+    if (hasTagMatch) matched.push('tags');
+  }
+  
+  return matched;
+}
+
+function generateHighlights(text, searchTerm, maxLength = 150) {
+  if (!text || !searchTerm) return text;
+  
+  const regex = new RegExp(`(${searchTerm})`, 'gi');
+  const highlighted = text.replace(regex, '<mark>$1</mark>');
+  
+  // Truncate if too long, keeping highlights
+  if (highlighted.length > maxLength) {
+    const index = highlighted.toLowerCase().indexOf(searchTerm.toLowerCase());
+    if (index !== -1) {
+      const start = Math.max(0, index - 50);
+      const end = Math.min(highlighted.length, start + maxLength);
+      return (start > 0 ? '...' : '') + 
+             highlighted.substring(start, end) + 
+             (end < highlighted.length ? '...' : '');
+    }
+  }
+  
+  return highlighted;
+}
+
+function removeDuplicates(results) {
+  const seen = new Set();
+  return results.filter(quote => {
+    const normalizedText = quote.text.trim().toLowerCase();
+    if (seen.has(normalizedText)) {
+      return false;
+    }
+    seen.add(normalizedText);
+    return true;
+  });
 }
 
 // translate
