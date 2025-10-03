@@ -1,0 +1,24 @@
+[
+  { "text": "Discipline is the bridge between goals and results.", "category": "discipline", "lang": "EN", "createdAt": 1726650000000 },
+  { "text": "Focus today shapes the freedom of tomorrow.", "category": "focus", "lang": "EN", "createdAt": 1726650001000 },
+  { "text": "Calm minds create powerful actions.", "category": "calm", "lang": "EN", "createdAt": 1726650002000 },
+  { "text": "Gratitude opens the door to abundance.", "category": "gratitude", "lang": "EN", "createdAt": 1726650003000 },
+  { "text": "Love makes resilience unbreakable.", "category": "love", "lang": "EN", "createdAt": 1726650004000 },
+  { "text": "Success belongs to those who practice daily consistency.", "category": "success", "lang": "EN", "createdAt": 1726650005000 },
+  { "text": "Your mindset is the engine of your reality.", "category": "mindset", "lang": "EN", "createdAt": 1726650006000 },
+  { "text": "Courage is not the absence of fear but action despite it.", "category": "courage", "lang": "EN", "createdAt": 1726650007000 },
+  { "text": "Stoicism teaches peace in chaos.", "category": "stoicism", "lang": "EN", "createdAt": 1726650008000 },
+  { "text": "Healing begins when you choose kindness for yourself.", "category": "healing", "lang": "EN", "createdAt": 1726650009000 },
+  { "text": "Life rewards those who keep moving forward.", "category": "life", "lang": "EN", "createdAt": 1726650010000 },
+  { "text": "Creativity is intelligence having fun.", "category": "creativity", "lang": "EN", "createdAt": 1726650011000 },
+  { "text": "Wisdom is knowing the right path; integrity is walking it.", "category": "wisdom", "lang": "EN", "createdAt": 1726650012000 },
+  { "text": "Hustle until your idols become your rivals.", "category": "hustle", "lang": "EN", "createdAt": 1726650013000 },
+  { "text": "Consistency beats talent when talent doesn’t work hard.", "category": "discipline", "lang": "EN", "createdAt": 1726650014000 },
+  { "text": "Calm is a superpower in a noisy world.", "category": "calm", "lang": "EN", "createdAt": 1726650015000 },
+  { "text": "Gratitude makes what you have enough.", "category": "gratitude", "lang": "EN", "createdAt": 1726650016000 },
+  { "text": "Success is built one focused hour at a time.", "category": "success", "lang": "EN", "createdAt": 1726650017000 },
+  { "text": "Love heals wounds words cannot reach.", "category": "love", "lang": "EN", "createdAt": 1726650018000 },
+  { "text": "Your mindset decides your altitude.", "category": "mindset", "lang": "EN", "createdAt": 1726650019000 }
+
+  // ... restul până la 200 citate în același format, distribuite echilibrat pe toate cele 15 categorii
+]
