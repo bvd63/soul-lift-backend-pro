@@ -39,6 +39,22 @@ create table if not exists push_tokens (
 
 create index if not exists idx_push_tokens_email on push_tokens (email);
 
+-- ========== QUOTES (BASIC) ==========
+create table if not exists quotes (
+  id         bigserial primary key,
+  quote      text not null,
+  author     text,
+  category   text,
+  language   text default 'EN',
+  created_at timestamptz default now()
+);
+
+create index if not exists idx_quotes_category on quotes (category);
+create index if not exists idx_quotes_language on quotes (language);
+create index if not exists idx_quotes_created_at on quotes (created_at desc);
+-- GIN index pentru full-text search în quotes
+CREATE INDEX IF NOT EXISTS quotes_fts_idx ON quotes USING GIN (to_tsvector('english', quote || ' ' || coalesce(author, '')));
+
 -- ========== AI QUOTES ==========
 create table if not exists ai_quotes (
   id         bigserial primary key,
@@ -81,6 +97,19 @@ create table if not exists refresh_tokens (
 );
 create index if not exists idx_refresh_email on refresh_tokens (email);
 create index if not exists idx_refresh_expires on refresh_tokens (expires_at);
+
+-- ========== STRIPE EVENTS IDEMPOTENCY ==========
+create table if not exists consumed_events (
+  id          bigserial primary key,
+  event_id    text not null,
+  event_type  text not null,
+  processed_at timestamptz default now(),
+  metadata    jsonb,
+  unique (event_id, event_type)
+);
+
+create index if not exists idx_consumed_events_processed_at on consumed_events (processed_at desc);
+create index if not exists idx_consumed_events_type on consumed_events (event_type);
 
 -- ========== EXTRA INDEXES ==========
 create index if not exists idx_favorites_created_at on favorites (created_at desc);
