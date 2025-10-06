@@ -8,7 +8,13 @@
     "start": "node index.js",
     "dev": "NODE_ENV=development node index.js",
     "start:prod": "NODE_ENV=production node index.js",
-    "test": "node --test"
+    "test": "node tests/basic.test.js",
+    "test:integration": "node tests/integration.test.js",
+    "test:logout": "node tests/logout.test.js",
+    "test:migration": "node tests/migration.test.js",
+    "test:all": "npm test && npm run test:logout && npm run test:migration",
+    "migrate": "node scripts/migrate.js",
+    "lint": "eslint ."
   },
   "engines": { "node": ">=20.10.0" },
   "dependencies": {
@@ -32,6 +38,9 @@
     "envalid": "7.3.1"
     ,
     "redis": "4.6.7"
+  },
+  "devDependencies": {
+    "eslint": "9.13.0"
   },
   "overrides": { "undici": "6.18.1" }
 }
