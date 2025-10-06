@@ -29,11 +29,21 @@ import fs from "fs";
 import dotenv from "dotenv";
 import { cleanEnv, str, bool, num } from "envalid";
 
-// Fix pentru warning-urile deprecation din Fastify 4
-process.removeAllListeners("warning");
-process.on("warning", (e) => {
-  if (!e.message.includes("request.routeOptions.config")) console.warn(e);
-});
+// Fix pentru warning-urile deprecation din Fastify 4 - abordare robustă
+process.env.NODE_NO_WARNINGS = '1';
+const originalEmit = process.emit;
+process.emit = function (name, data, ...args) {
+  if (
+    name === 'warning' &&
+    data &&
+    data.name === 'DeprecationWarning' &&
+    (data.message.includes('request.routeOptions.config') ||
+     data.message.includes('fastify-warning'))
+  ) {
+    return false;
+  }
+  return originalEmit.apply(process, arguments);
+};
 import logger from "./src/utils/logger.js";
 import * as respond from "./src/utils/respond.js";
 import { createJobSupervisor } from "./src/jobs/supervisor.js";
