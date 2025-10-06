@@ -29,8 +29,12 @@ import fs from "fs";
 import dotenv from "dotenv";
 import { cleanEnv, str, bool, num } from "envalid";
 import logger from "./src/utils/logger.js";
+import * as respond from "./src/utils/respond.js";
+import { createJobSupervisor } from "./src/jobs/supervisor.js";
 import apiRetry from "./src/utils/apiRetry.js";
 import cache from "./src/utils/cache.js";
+// security/plugins are registered later in a single block
+import { validateEnv } from "./src/config/validateEnv.js";
 
 // ---------- basic setup ----------
 dotenv.config();
@@ -61,12 +65,42 @@ const isProd = env.NODE_ENV === "production";
 const app = Fastify({
   logger: { level: isProd ? "info" : "debug" },
   bodyLimit: 1 * 1024 * 1024,
+  genReqId: (req) => req.headers['x-request-id'] || `req-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+});
+
+// Validate environment at startup
+const envCheck = validateEnv({ isProd });
+if (!envCheck.ok) {
+  app.log.warn({ errors: envCheck.errors, warnings: envCheck.warnings }, 'ENV validation warnings');
+} else if (envCheck.warnings?.length) {
+  app.log.info({ warnings: envCheck.warnings }, 'ENV validation notes');
+}
+
+// Set X-Request-ID on responses
+app.addHook('onSend', async (req, rep, payload) => {
+  rep.header('X-Request-ID', req.id);
+  return payload;
+});
+
+// Global error handler
+app.setErrorHandler((error, request, reply) => {
+  const status = error.statusCode || 500;
+  request.log.error({ reqId: request.id, err: error.message, stack: isProd ? undefined : error.stack }, 'Unhandled error');
+  reply.code(status).send({ ok: false, error: error.message || 'Internal Server Error' });
+});
+
+// 404 handler
+app.setNotFoundHandler((request, reply) => {
+  request.log.warn({ reqId: request.id, url: request.url, method: request.method }, 'Route not found');
+  reply.code(404).send({ ok: false, error: 'Not Found' });
 });
 
 // Build info logging at startup
 let pkgVersion = "unknown";
+let buildCommit = process.env.BUILD_COMMIT || "unknown";
+let buildTime = process.env.BUILD_TIME || "unknown";
 try { pkgVersion = JSON.parse(fs.readFileSync("./package.json", "utf-8")).version; } catch {}
-app.log.info({ version: pkgVersion, node: process.version, env: env.NODE_ENV }, "Booting SoulLift API");
+app.log.info({ version: pkgVersion, commit: buildCommit, builtAt: buildTime, node: process.version, env: env.NODE_ENV }, "Booting SoulLift API");
 
 const PORT = env.PORT;
 const JWT_SECRET = env.JWT_SECRET;
@@ -169,17 +203,6 @@ app.addHook('onResponse', (request, reply, done) => {
   const rid = request.requestId || request.id;
   if (rid) reply.header('x-request-id', rid);
   done();
-});
-// Global error handler
-app.setErrorHandler((err, req, rep) => {
-  app.log.error({ err }, "Unhandled error");
-  const status = err.statusCode || 500;
-  const code = err.code || "INTERNAL_ERROR";
-  rep.code(status).send({ error: "Internal error", code });
-});
-// 404 handler standard JSON
-app.setNotFoundHandler((req, rep) => {
-  rep.code(404).send({ ok: false, error: "Not Found", path: req.url });
 });
 // Process-level handlers
 process.on('uncaughtException', (e) => {
@@ -416,6 +439,7 @@ if (REDIS_URL) {
   });
 }
 
+
 const QUOTES = [
   { id: "q1", text: "Your future is created by what you do today, not tomorrow.", author: "Robert Kiyosaki", source: "Interview", year: 2001, premium: false },
   { id: "q2", text: "Success is not for the lazy.", author: "Jim Rohn", source: "Seminar", year: 1985, premium: false },
@@ -594,11 +618,13 @@ async function generateBatchStore(count = 10) {
   }
 }
 
+// supervise AI batch generation to avoid overlaps
+const aiBatchSupervisor = createJobSupervisor("aiBatch", app.log);
 // initial fill (best-effort)
-(async () => { try { await generateBatchStore(10); } catch (e) { app.log.warn("initial ai gen", e); } })();
+(async () => { try { await aiBatchSupervisor.run(() => generateBatchStore(10)); } catch (e) { app.log.warn("initial ai gen", e); } })();
 // daily cron at 06:00 Europe/Bucharest
 cron.schedule("0 6 * * *", async () => {
-  try { await generateBatchStore(10); } catch (e) { app.log.warn("cron ai gen", e); }
+  try { await aiBatchSupervisor.run(() => generateBatchStore(10)); } catch (e) { app.log.warn("cron ai gen", e); }
 }, { timezone: "Europe/Bucharest" });
 
 // ---------- routes ----------
@@ -625,8 +651,7 @@ app.get("/api/health", {
     summary: 'Health check extins',
     response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, api: { type: 'string' }, redis: { type: 'string' }, openai: { type: 'string' }, stripe: { type: 'string' } } } }
   }
-}, async () => ({
-  ok: true,
+}, async () => respond.ok({
   api: 'up',
   redis: cache.isRedisConnected() ? 'up' : 'down',
   openai: OPENAI_KEY ? 'configured' : 'missing',
@@ -2056,3 +2081,4 @@ try {
   app.log.error(e);
   process.exit(1);
 }
+// Security plugins
