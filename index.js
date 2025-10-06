@@ -30,6 +30,7 @@ import dotenv from "dotenv";
 import { cleanEnv, str, bool, num } from "envalid";
 import logger from "./src/utils/logger.js";
 import apiRetry from "./src/utils/apiRetry.js";
+import cache from "./src/utils/cache.js";
 
 // ---------- basic setup ----------
 dotenv.config();
@@ -59,12 +60,18 @@ const env = cleanEnv(process.env, {
 const isProd = env.NODE_ENV === "production";
 const app = Fastify({
   logger: { level: isProd ? "info" : "debug" },
-  bodyLimit: 64 * 1024,
+  bodyLimit: 1 * 1024 * 1024,
 });
+
+// Build info logging at startup
+let pkgVersion = "unknown";
+try { pkgVersion = JSON.parse(fs.readFileSync("./package.json", "utf-8")).version; } catch {}
+app.log.info({ version: pkgVersion, node: process.version, env: env.NODE_ENV }, "Booting SoulLift API");
 
 const PORT = env.PORT;
 const JWT_SECRET = env.JWT_SECRET;
 const FRONTEND_URL = env.FRONTEND_URL;
+const REDIS_URL = process.env.REDIS_URL || process.env.UPSTASH_REDIS_REST_URL || "";
 
 // Flags/keys
 const USE_OPENAI = (env.USE_OPENAI || "true").toLowerCase() !== "false";
@@ -134,8 +141,21 @@ await app.register(cors, {
   },
   credentials: true
 });
-await app.register(helmet, { global: true, contentSecurityPolicy: false });
-await app.register(rateLimit, { global: false });
+await app.register(helmet, {
+  global: true,
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      defaultSrc: ["'self'"],
+      imgSrc: ["'self'", "data:"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+    },
+  },
+  xssFilter: true,
+  noSniff: true,
+});
+await app.register(rateLimit, { global: true, max: 200, timeWindow: '1m', allowList: [] });
 
 // Înregistrăm sistemul de logging avansat
 await app.register(compress);
@@ -144,12 +164,31 @@ await app.register(swaggerUI, { routePrefix: "/docs" });
 await app.register(metrics, { endpoint: "/metrics", defaultMetrics: { enabled: true } });
 await app.register(fastifyRawBody, { field: "rawBody", global: false, runFirst: true });
 await app.register(logger.fastifyPlugin, { logLevel: isProd ? "info" : "debug" });
+// Header Request-ID
+app.addHook('onResponse', (request, reply, done) => {
+  const rid = request.requestId || request.id;
+  if (rid) reply.header('x-request-id', rid);
+  done();
+});
 // Global error handler
 app.setErrorHandler((err, req, rep) => {
   app.log.error({ err }, "Unhandled error");
   const status = err.statusCode || 500;
   const code = err.code || "INTERNAL_ERROR";
   rep.code(status).send({ error: "Internal error", code });
+});
+// 404 handler standard JSON
+app.setNotFoundHandler((req, rep) => {
+  rep.code(404).send({ ok: false, error: "Not Found", path: req.url });
+});
+// Process-level handlers
+process.on('uncaughtException', (e) => {
+  Sentry.captureException(e);
+  app.log.error({ err: e }, 'uncaughtException');
+});
+process.on('unhandledRejection', (reason) => {
+  Sentry.captureException(reason);
+  app.log.error({ err: reason }, 'unhandledRejection');
 });
 
 // ---------- schema sanity check ----------
@@ -312,7 +351,18 @@ function authMiddleware(req, rep, done) {
   const a = req.headers.authorization;
   if (!a) return rep.code(401).send({ error: "Missing Authorization header" });
   const token = a.split(" ")[1];
-  try { req.user = jwt.verify(token, JWT_SECRET); done(); }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    // Check blacklist optional (Redis)
+    cache.get(`blacklist:access:${token}`).then((blocked) => {
+      if (blocked) return rep.code(401).send({ error: 'token revoked' });
+      req.user = decoded;
+      done();
+    }).catch(() => {
+      req.user = decoded;
+      done();
+    });
+  }
   catch { return rep.code(401).send({ error: "Invalid token" }); }
 }
 function todayStr() { return new Date().toISOString().slice(0, 10); }
@@ -357,6 +407,14 @@ function computeCategoriesMeta() {
   }
 }
 computeCategoriesMeta();
+// Redis init
+if (REDIS_URL) {
+  cache.initRedis(REDIS_URL).then((ok) => {
+    app.log.info({ ok }, 'Redis init');
+  }).catch((e) => {
+    app.log.warn({ err: e?.message || e }, 'Redis init failed');
+  });
+}
 
 const QUOTES = [
   { id: "q1", text: "Your future is created by what you do today, not tomorrow.", author: "Robert Kiyosaki", source: "Interview", year: 2001, premium: false },
@@ -383,29 +441,37 @@ async function openaiChat(messages, opts = {}) {
     temperature: opts.temperature ?? 0.5,
     max_tokens: opts.max_tokens ?? 150,
   };
-  const data = await fetchWithRetry(
+  const res = await fetchWithRetry(
     "https://api.openai.com/v1/chat/completions",
     {
       method: "POST",
       headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
     },
-    { maxRetries: 3, initialDelay: 400 }
+    { maxRetries: 3, initialDelay: 400, returnMeta: true }
   );
-  return data?.choices?.[0]?.message?.content?.trim();
+  try {
+    const rateRem = res?.headers?.["x-ratelimit-remaining"] ?? res?.headers?.["ratelimit-remaining"];
+    app.log.info("OpenAI chat completions răspuns", { status: res?.status, rateRemaining: rateRem });
+  } catch {}
+  return res?.data?.choices?.[0]?.message?.content?.trim();
 }
 async function openaiEmbedding(text) {
   if (!aiEnabled()) return null;
-  const data = await fetchWithRetry(
+  const res = await fetchWithRetry(
     "https://api.openai.com/v1/embeddings",
     {
       method: "POST",
       headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ model: "text-embedding-3-small", input: text }),
     },
-    { maxRetries: 3, initialDelay: 400 }
+    { maxRetries: 3, initialDelay: 400, returnMeta: true }
   );
-  return data?.data?.[0]?.embedding || null;
+  try {
+    const rateRem = res?.headers?.["x-ratelimit-remaining"] ?? res?.headers?.["ratelimit-remaining"];
+    app.log.info("OpenAI embeddings răspuns", { status: res?.status, rateRemaining: rateRem });
+  } catch {}
+  return res?.data?.data?.[0]?.embedding || null;
 }
 function cosine(a, b) {
   if (!a || !b || a.length !== b.length) return 0;
@@ -423,13 +489,19 @@ async function generateAIQuote() {
     { role: "user", content: "Motivation for daily progress" },
   ];
   let lastErr;
+  app.log.debug("generateAIQuote start");
   for (let i = 0; i < 3; i++) {
     try {
+      app.log.debug("generateAIQuote attempt", { attempt: i + 1 });
       const text = await openaiChat(messages, { temperature: 0.8, max_tokens: 60 });
       const cleaned = (text || "").replace(/^\"|\"$/g, "").trim();
-      if (cleaned && cleaned.length >= 8) return cleaned;
+      if (cleaned && cleaned.length >= 8) {
+        app.log.info("generateAIQuote success", { attempt: i + 1, length: cleaned.length });
+        return cleaned;
+      }
+      app.log.debug("generateAIQuote too short, retry", { attempt: i + 1, length: cleaned.length });
       await sleep(300 * (i + 1));
-    } catch (e) { lastErr = e; await sleep(300 * (i + 1)); }
+    } catch (e) { lastErr = e; app.log.warn("generateAIQuote error", { attempt: i + 1, error: e?.message || String(e) }); await sleep(300 * (i + 1)); }
   }
   if (lastErr) throw lastErr;
   throw new Error("Failed to generate quote");
@@ -547,6 +619,19 @@ app.get("/health", {
     response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, ts: { type: 'integer' } } } }
   }
 }, async () => ({ ok: true, ts: Date.now() }));
+app.get("/api/health", {
+  schema: {
+    tags: ['System'],
+    summary: 'Health check extins',
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, api: { type: 'string' }, redis: { type: 'string' }, openai: { type: 'string' }, stripe: { type: 'string' } } } }
+  }
+}, async () => ({
+  ok: true,
+  api: 'up',
+  redis: cache.isRedisConnected() ? 'up' : 'down',
+  openai: OPENAI_KEY ? 'configured' : 'missing',
+  stripe: (env.STRIPE_SECRET_KEY ? 'configured' : 'missing')
+}));
 app.get("/healthz", {
   schema: {
     tags: ['System'],
@@ -755,6 +840,27 @@ app.post("/api/refresh", {
     return { ok: true, accessToken: access, refreshToken: newRefresh };
   } catch { return rep.code(401).send({ error: "Invalid refresh token" }); }
 });
+// Logout + blacklist access token
+app.post('/api/auth/logout', {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Auth'],
+    summary: 'Logout și blacklist token',
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' } } }, 400: { type: 'object', properties: { error: { type: 'string' } } } }
+  }
+}, async (req, rep) => {
+  const a = req.headers.authorization || '';
+  const token = a.startsWith('Bearer ') ? a.slice(7) : '';
+  if (!token) return rep.code(400).send({ error: 'token missing' });
+  try {
+    const { exp } = jwt.verify(token, JWT_SECRET);
+    const ttl = Math.max(1, (exp || Math.floor(Date.now()/1000)+900) - Math.floor(Date.now()/1000));
+    await cache.set(`blacklist:access:${token}`, true, ttl);
+    return { ok: true };
+  } catch {
+    return rep.code(400).send({ error: 'invalid token' });
+  }
+});
 
 // categories & quotes
 app.get("/api/categories", {
@@ -793,10 +899,31 @@ app.get("/api/categories", {
     }
   }
 
+  // Redis-backed TTL caching (fallback la memoryCache)
+  const cacheKey = "cache:categories:v1";
+  try {
+    const cached = await cache.get(cacheKey);
+    if (cached && Array.isArray(cached.categories)) {
+      if (categoriesETag) rep.header("ETag", categoriesETag);
+      if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
+      rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
+      return { ok: true, categories: cached.categories };
+    }
+  } catch (e) {
+    // dacă cache e indisponibil, continuăm fără să întrerupem răspunsul
+    app.log.warn("Categories cache read failed", { error: e?.message || String(e) });
+  }
+
   if (categoriesETag) rep.header("ETag", categoriesETag);
   if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
   rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
-  return { ok: true, categories };
+  const payload = { ok: true, categories };
+  try {
+    await cache.set(cacheKey, { categories }, 3600);
+  } catch (e) {
+    app.log.warn("Categories cache write failed", { error: e?.message || String(e) });
+  }
+  return payload;
 });
 
 // /v1 alias for categories
