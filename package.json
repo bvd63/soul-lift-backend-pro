@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "NODE_ENV=development node index.js"
+    "dev": "NODE_ENV=development node index.js",
+    "test": "node --test"
   },
   "engines": { "node": ">=20.10.0" },
   "dependencies": {
