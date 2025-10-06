@@ -28,6 +28,12 @@ import * as Sentry from "@sentry/node";
 import fs from "fs";
 import dotenv from "dotenv";
 import { cleanEnv, str, bool, num } from "envalid";
+
+// Fix pentru warning-urile deprecation din Fastify 4
+process.removeAllListeners("warning");
+process.on("warning", (e) => {
+  if (!e.message.includes("request.routeOptions.config")) console.warn(e);
+});
 import logger from "./src/utils/logger.js";
 import * as respond from "./src/utils/respond.js";
 import { createJobSupervisor } from "./src/jobs/supervisor.js";
