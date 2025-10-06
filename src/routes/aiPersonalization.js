@@ -3,7 +3,7 @@
 
 import validator from '../utils/validator.js';
 import apiRetry from '../utils/apiRetry.js';
-import memoryCache from '../utils/memoryCache.js';
+import redisClient from '../services/redisClient.js';
 
 /**
  * Înregistrează rutele pentru personalizarea citatelor cu AI
@@ -64,7 +64,7 @@ export default async function (fastify, options) {
       
       // Verificăm cache-ul pentru a evita generări redundante
       const cacheKey = `personalize-${userId}-${JSON.stringify(preferences)}-${JSON.stringify(topics)}-${style}-${length}-${language}`;
-      const cachedResponse = memoryCache.get(cacheKey);
+      const cachedResponse = await redisClient.get(cacheKey);
       
       if (cachedResponse) {
         // Înregistrăm utilizarea cache-ului
@@ -152,8 +152,8 @@ Răspunde doar cu citatul generat, fără ghilimele sau alte explicații.`;
         topics: topics
       };
 
-      // Salvăm în cache pentru utilizări viitoare
-      memoryCache.set(cacheKey, response, 3600000); // 1 oră
+      // Salvăm în cache în Redis pentru utilizări viitoare (1 oră)
+      await redisClient.set(cacheKey, response, 3600);
 
       return response;
     } catch (error) {
