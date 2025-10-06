@@ -1,141 +1,109 @@
-// src/utils/cache.js — Redis cache cu fallback la memoryCache + suport Upstash REST
-import memoryCache from './memoryCache.js';
-import fetch from 'node-fetch';
+# render.yaml — SoulLift backend (Fastify + Stripe + OpenAI/DeepL + FCM v1 + Sentry)
+# Compatibil cu index.js (health: /health, cron intern, Stripe raw-body)
+envVarGroups:
+  - name: soullift-common
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CORS_ORIGINS
+        value: "http://localhost:5173"
+      - key: USE_OPENAI
+        value: "true"
+      - key: DEEPL_ENDPOINT
+        value: "https://api-free.deepl.com"
+      - key: SENTRY_DSN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_SSL
+        value: false
 
-let redisClient = null;
-let redisReady = false;
+services:
+  - type: web
+    name: soullift-backend
+    env: node
+    plan: starter              # poți pune "free" pentru test, dar "starter" e mai stabil
+    region: frankfurt          # sau oregon/singapore, după publicul tău
+    branch: main
+    autoDeploy: true
+    pullRequestPreviewsEnabled: false
 
-// Upstash REST mode
-let restMode = false;
-let restUrl = '';
-let restToken = '';
-let restReady = false;
+    envVarGroups:
+      - soullift-common
 
-async function initRedis(redisUrl) {
-  if (!redisUrl) return false;
-  // Detectăm Upstash REST (HTTPS) vs client Redis clasic (redis://, rediss://)
-  const isHttp = /^https?:\/\//.test(redisUrl);
-  if (isHttp) {
-    restMode = true;
-    restUrl = redisUrl.replace(/\/$/, '');
-    restToken = process.env.UPSTASH_REDIS_REST_TOKEN || '';
-    try {
-      const r = await fetch(`${restUrl}/PING`, { headers: restToken ? { Authorization: `Bearer ${restToken}` } : {} });
-      const t = await r.text();
-      restReady = r.ok && /PONG/i.test(t);
-      if (!restReady) throw new Error(`Upstash PING failed: ${r.status}`);
-      return true;
-    } catch (e) {
-      console.warn('Upstash REST indisponibil, folosim cache local:', e?.message || e);
-      restReady = false;
-      return false;
-    }
-  }
+    buildCommand: "npm ci"
+    startCommand: "node index.js"
 
-  try {
-    const { createClient } = await import('redis');
-    // Suport Redis Enterprise Cloud: username/parolă și TLS
-    const isSecure = /^rediss:\/\//.test(redisUrl) || String(process.env.REDIS_TLS || '').toLowerCase() === 'true';
-    const username = process.env.REDIS_USERNAME || undefined;
-    const password = process.env.REDIS_PASSWORD || undefined;
-    const clientOpts = { url: redisUrl };
-    if (username) clientOpts.username = username;
-    if (password) clientOpts.password = password;
-    if (isSecure) clientOpts.socket = { tls: true };
+    # Se potrivește cu rutele din index.js (există și /healthz ca alias)
+    healthCheckPath: /api/health
+    healthCheckTimeout: 100
 
-    redisClient = createClient(clientOpts);
-    redisClient.on('error', (err) => {
-      redisReady = false;
-      console.error('Redis error:', err?.message || err);
-    });
-    redisClient.on('ready', () => { redisReady = true; });
-    await redisClient.connect();
-    redisReady = true;
-    return true;
-  } catch (e) {
-    console.warn('Redis indisponibil, folosim cache local:', e?.message || e);
-    redisClient = null;
-    redisReady = false;
-    return false;
-  }
-}
+    envVars:
+      # Runtime
+      - key: NODE_VERSION
+        value: 20
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: APP_BASE_URL
+        value: "https://soullift-backend.onrender.com"   # ajustează după ce ai domeniu
+      - key: FRONTEND_URL
+        value: "http://localhost:5173"                    # ajustează la frontend-ul tău
 
-async function get(key) {
-  // Upstash REST
-  if (restMode && restReady) {
-    try {
-      const r = await fetch(`${restUrl}/GET/${encodeURIComponent(key)}`, { headers: restToken ? { Authorization: `Bearer ${restToken}` } : {} });
-      if (!r.ok) return null;
-      const txt = await r.text();
-      if (txt === 'null' || txt === '') return null;
-      try { return JSON.parse(txt); } catch { return txt; }
-    } catch (e) {
-      console.warn('Upstash GET fail:', e?.message || e);
-      return memoryCache.get(key);
-    }
-  }
-  // Redis client
-  if (redisClient && redisReady) {
-    const v = await redisClient.get(key);
-    if (v == null) return null;
-    try { return JSON.parse(v); } catch { return v; }
-  }
-  return memoryCache.get(key);
-}
+      # --- Secrets necesare (setează valorile în Dashboard; aici le lăsăm ne-sincronizate) ---
+      # Auth / JWT
+      - key: JWT_SECRET
+        sync: false
 
-async function set(key, value, ttlSec) {
-  const v = typeof value === 'string' ? value : JSON.stringify(value);
-  // Upstash REST
-  if (restMode && restReady) {
-    try {
-      const url = ttlSec && ttlSec > 0
-        ? `${restUrl}/SET/${encodeURIComponent(key)}/${encodeURIComponent(v)}?EX=${ttlSec}`
-        : `${restUrl}/SET/${encodeURIComponent(key)}/${encodeURIComponent(v)}`;
-      const r = await fetch(url, { headers: restToken ? { Authorization: `Bearer ${restToken}` } : {} });
-      if (!r.ok) throw new Error(`Upstash SET failed: ${r.status}`);
-      return true;
-    } catch (e) {
-      console.warn('Upstash SET fail, fallback mem:', e?.message || e);
-    }
-  }
-  // Redis client
-  if (redisClient && redisReady) {
-    if (ttlSec && ttlSec > 0) {
-      await redisClient.set(key, v, { EX: ttlSec });
-    } else {
-      await redisClient.set(key, v);
-    }
-    return true;
-  }
-  memoryCache.set(key, value, ttlSec ? ttlSec * 1000 : undefined);
-  return true;
-}
+      # OpenAI / DeepL
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DEEPL_API_KEY
+        sync: false
+      - key: DEEPL_ENDPOINT
+        value: "https://api-free.deepl.com"
 
-async function del(key) {
-  // Upstash REST
-  if (restMode && restReady) {
-    try {
-      const r = await fetch(`${restUrl}/DEL/${encodeURIComponent(key)}`, { headers: restToken ? { Authorization: `Bearer ${restToken}` } : {} });
-      if (!r.ok) throw new Error(`Upstash DEL failed: ${r.status}`);
-      return true;
-    } catch (e) {
-      console.warn('Upstash DEL fail, fallback mem:', e?.message || e);
-    }
-  }
-  // Redis client
-  if (redisClient && redisReady) {
-    await redisClient.del(key);
-    return true;
-  }
-  memoryCache.del(key);
-  return true;
-}
+      # Stripe
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_ID_MONTHLY
+        sync: false
+      - key: STRIPE_PRICE_ID_YEARLY
+        sync: false
 
-function isRedisConnected() { return !!(redisClient && redisReady) || !!restReady; }
+      # FCM v1 (Service Account) — înlocuiește FCM_SERVER_KEY (legacy)
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY       # păstrează \n în valoare
+        sync: false
 
-async function quit() {
-  if (redisClient) { await redisClient.quit(); redisReady = false; }
-  // Upstash REST nu necesită închidere
-}
+      # Sentry (opțional)
+      - key: SENTRY_DSN
+        sync: false
 
-export default { initRedis, get, set, del, isRedisConnected, quit };
+      # Daily Digest Telegram (opțional)
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+
+      # Redis Enterprise Cloud (Managed)
+      - key: REDIS_URL
+        sync: false
+      - key: REDIS_USERNAME
+        value: default
+      - key: REDIS_PASSWORD
+        sync: false
+      - key: REDIS_TLS
+        value: true
+
+      # Upstash Redis REST (alternativ, nu seta REDIS_URL dacă folosești asta)
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
