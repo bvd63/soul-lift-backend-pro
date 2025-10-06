@@ -213,6 +213,10 @@ const ensureTables = async () => {
       created_at timestamptz default now()
     );
   `);
+  // Index pentru interogări rapide după email și ordine descendentă a timpului
+  await query(`
+    create index if not exists idx_inbox_email_created on notifications_inbox(email, created_at desc);
+  `);
   await query(`
     create table if not exists ai_quotes (
       id bigserial primary key,
@@ -231,6 +235,10 @@ const ensureTables = async () => {
       email text,
       meta jsonb
     );
+  `);
+  // Index pentru filtrare rapidă după email
+  await query(`
+    create index if not exists idx_audit_email on audit_log(email);
   `);
 };
 await ensureTables();
@@ -1403,6 +1411,8 @@ app.post("/api/notify/test", {
   return { ok: true, sent };
 });
 app.post("/api/notify/broadcast", {
+  preHandler: [authMiddleware],
+  config: { rateLimit: { max: 3, timeWindow: '1m' } },
   schema: {
     tags: ['Notify'],
     summary: 'Broadcast push notification',
@@ -1413,7 +1423,8 @@ app.post("/api/notify/broadcast", {
         body: { type: 'string', minLength: 1 },
         proOnly: { type: 'boolean' },
         topic: { type: 'string' }
-      }
+      },
+      required: ['title','body']
     },
     response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, sent: { type: 'integer', minimum: 0 } } } }
   }
@@ -1505,28 +1516,6 @@ app.post("/api/notify/inbox/read", {
   }
   await pushAudit("notify:inbox:read", req.user.email, { id, all });
   return { ok: true, updated: res.rowCount || 0 };
-});
-app.post("/api/notify/broadcast", async (req, rep) => {
-  const { title = "SoulLift", body = "Hello!", proOnly = true, topic = null } = req.body || {};
-  const { rows } = await query(`select email, token from push_tokens`);
-  const groups = {};
-  for (const r of rows) { groups[r.email] = groups[r.email] || []; groups[r.email].push(r.token); }
-  let total = 0;
-  for (const email of Object.keys(groups)) {
-    if (proOnly) {
-      const { rows: urows } = await query(`select subscription_status from users where email=$1`, [email]);
-      if (urows[0]?.subscription_status !== "active") continue;
-    }
-    const prefs = await getNotificationPrefs(email);
-    // Adaugăm în inbox indiferent de preferințe (util pentru vizualizare în app)
-    try { await query(`insert into notifications_inbox(email,title,body,data) values($1,$2,$3,$4)`, [email, title, body, JSON.stringify({ type: "broadcast", topic: topic || undefined })]); } catch {}
-    if (prefs.mute || isQuietNow(prefs)) continue;
-    if (topic && Array.isArray(prefs.topics) && prefs.topics.length && !prefs.topics.includes(topic)) continue;
-    try { total += await fcmSendV1(groups[email], { title, body, data: { type: "broadcast", topic: topic || undefined } }); await sleep(100); }
-    catch (e) { app.log.warn("broadcast err", e); }
-  }
-  await pushAudit("notify:broadcast", null, { total });
-  return { ok: true, sent: total };
 });
 
 // ---------- AI-powered features: recommendations, dunning, winback ----------
@@ -1628,6 +1617,7 @@ cron.schedule("30 7 * * *", async () => {
 
 // ---------- admin/test & export ----------
 app.post("/admin/telegram/test", {
+  config: { rateLimit: { max: 3, timeWindow: '1m' } },
   schema: {
     tags: ['Admin'],
     summary: 'Send test Telegram message',
@@ -1704,6 +1694,7 @@ app.get("/api/gdpr/export", {
   schema: {
     tags: ['GDPR'],
     summary: 'Exportă datele personale (GDPR)',
+    querystring: { type: 'object', properties: { download: { type: 'boolean', default: false } } },
     response: {
       200: {
         type: 'object',
@@ -1745,7 +1736,12 @@ app.get("/api/gdpr/export", {
       [email]
     )).rows;
 
+    const { download = false } = req.query || {};
     await pushAudit("gdpr:export", email, { items: { favorites: favorites.length, push_tokens: pushTokens.length, inbox: inbox.length, audit: audit.length } });
+    if (download) {
+      rep.header('Content-Type', 'application/json');
+      rep.header('Content-Disposition', `attachment; filename="gdpr-export-${email}.json"`);
+    }
     return { ok: true, data: { user, favorites, push_tokens: pushTokens, notification_preferences: prefs, inbox, audit_log: audit } };
   } catch (e) {
     app.log.error(e);
@@ -1781,6 +1777,36 @@ app.post("/api/gdpr/delete", {
   try {
     const exists = (await query(`select 1 from users where email=$1`, [email])).rows[0];
     if (!exists) return rep.code(404).send({ error: "Utilizator inexistent" });
+
+    // v1: anulăm abonamentul Stripe dacă există
+    try {
+      const subRow = (await query(`select stripe_sub_id from users where email=$1`, [email])).rows[0];
+      const stripeSubId = subRow?.stripe_sub_id;
+      if (stripeSubId) {
+        await stripe.subscriptions.cancel(stripeSubId);
+        await pushAudit("gdpr:stripe_cancel", email, { ok: true, sub_id: stripeSubId, v: "v1" });
+      } else {
+        await pushAudit("gdpr:stripe_cancel", email, { ok: false, reason: "no_subscription", v: "v1" });
+      }
+    } catch (e) {
+      app.log.warn({ err: e }, "Stripe cancel failed (v1)");
+      await pushAudit("gdpr:stripe_cancel", email, { ok: false, error: "cancel_failed", v: "v1" });
+    }
+
+    // Dacă utilizatorul are un abonament Stripe, îl anulăm înainte de ștergere
+    try {
+      const subRow = (await query(`select stripe_sub_id from users where email=$1`, [email])).rows[0];
+      const stripeSubId = subRow?.stripe_sub_id;
+      if (stripeSubId) {
+        await stripe.subscriptions.cancel(stripeSubId);
+        await pushAudit("gdpr:stripe_cancel", email, { ok: true, sub_id: stripeSubId });
+      } else {
+        await pushAudit("gdpr:stripe_cancel", email, { ok: false, reason: "no_subscription" });
+      }
+    } catch (e) {
+      app.log.warn({ err: e }, "Stripe cancel failed");
+      await pushAudit("gdpr:stripe_cancel", email, { ok: false, error: "cancel_failed" });
+    }
 
     const favCount = (await query(`select count(*)::int as c from favorites where email=$1`, [email])).rows[0]?.c || 0;
     const tokCount = (await query(`select count(*)::int as c from push_tokens where email=$1`, [email])).rows[0]?.c || 0;
@@ -1818,6 +1844,7 @@ app.get("/v1/gdpr/export", {
   schema: {
     tags: ['GDPR'],
     summary: 'Exportă datele personale (v1)',
+    querystring: { type: 'object', properties: { download: { type: 'boolean', default: false } } },
     response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, data: { type: 'object' } } } }
   }
 }, async (req, rep) => {
@@ -1834,7 +1861,12 @@ app.get("/v1/gdpr/export", {
     const prefs = (await query(`select email, topics, mute, quiet_hours, updated_at from notification_preferences where email=$1`, [email])).rows[0] || null;
     const inbox = (await query(`select id, title, body, data, read, created_at from notifications_inbox where email=$1 order by created_at desc limit 200`, [email])).rows;
     const audit = (await query(`select id, ts, type, meta from audit_log where email=$1 order by ts desc limit 200`, [email])).rows;
+    const { download = false } = req.query || {};
     await pushAudit("gdpr:export", email, { items: { favorites: favorites.length, push_tokens: pushTokens.length, inbox: inbox.length, audit: audit.length }, v: "v1" });
+    if (download) {
+      rep.header('Content-Type', 'application/json');
+      rep.header('Content-Disposition', `attachment; filename="gdpr-export-${email}.json"`);
+    }
     return { ok: true, data: { user, favorites, push_tokens: pushTokens, notification_preferences: prefs, inbox, audit_log: audit } };
   } catch (e) {
     app.log.error(e);
