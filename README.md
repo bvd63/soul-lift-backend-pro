@@ -1,16 +1,21 @@
 # Soul Lift Backend
 
 ## Overview
-Soul Lift Backend is a minimal yet powerful backend designed to handle AI-driven functionalities, including personalized recommendations and quotes. It leverages modern technologies like Fastify, Redis, and Stripe for scalability and performance.
+Soul Lift Backend is a production-ready backend designed to handle AI-driven functionalities, including personalized recommendations and quotes. It leverages modern technologies like Fastify, PostgreSQL, Redis, and Stripe for scalability and performance.
 
 ## Features
-- AI personalization and recommendations
-- Advanced caching with Redis
-- Secure API with JWT authentication
-- Integration with Stripe for payments
-- Logging and monitoring with Sentry
+- 🤖 AI personalization and recommendations (OpenAI + DeepL fallback)
+- 🔐 Secure JWT authentication with blacklist support
+- 💳 Stripe payment integration with webhook verification
+- 📊 Advanced caching with Redis/Upstash and fallback to memory cache
+- 🚀 Health monitoring and metrics
+- 📝 Comprehensive API documentation with Swagger
+- 🔍 Logging and monitoring with Sentry
+- 🧪 Full test coverage including integration tests
 
-## Installation
+## Quick Start
+
+### Installation
 1. Clone the repository:
    ```bash
    git clone https://github.com/your-repo/soul-lift-backend.git
@@ -24,14 +29,68 @@ Soul Lift Backend is a minimal yet powerful backend designed to handle AI-driven
    npm install
    ```
 
-## Environment Variables
-Create a `.env` file in the root directory and configure the following variables:
+### Environment Setup
+Create a `.env` file in the root directory. See [INTEGRATION_TESTING.md](./INTEGRATION_TESTING.md) for complete environment variable documentation.
+
+**Essential variables:**
 ```env
-OPENAI_API_KEY=your_openai_api_key
-ORIGIN=your_origin_url
-JWT_SECRET=your_jwt_secret
-REDIS_URL=your_redis_url
-STRIPE_SECRET_KEY=your_stripe_secret_key
+NODE_ENV=development
+JWT_SECRET=your-secret-key-here
+DATABASE_URL=postgresql://user:pass@host:port/db
 ```
 
-Refer to `.env.example` for more details.
+### Database Setup
+```bash
+# Run database migrations
+npm run migrate
+```
+
+### Running the Server
+```bash
+# Development mode
+npm run dev
+
+# Production mode
+npm run start:prod
+```
+
+## Testing
+
+### Basic Tests (No External Dependencies)
+```bash
+npm test                    # Core functionality tests
+npm run test:logout         # JWT authentication flow tests  
+npm run test:migration      # Database migration validation
+npm run test:all           # All basic tests
+```
+
+### Integration Tests (Requires Real API Keys)
+```bash
+npm run test:integration    # E2E tests with Stripe, OpenAI, etc.
+```
+
+See [INTEGRATION_TESTING.md](./INTEGRATION_TESTING.md) for detailed testing documentation.
+
+## API Documentation
+
+- **Swagger UI**: `/docs` (when server is running)
+- **Health Check**: `/health` 
+- **Metrics**: `/metrics` (Prometheus format)
+
+## Architecture
+
+### Core Components
+- **Fastify**: Web framework with plugin architecture
+- **PostgreSQL**: Primary database with connection pooling
+- **Redis/Upstash**: Distributed caching and session storage
+- **Stripe**: Payment processing and webhook handling
+- **OpenAI**: AI personalization with retry logic
+- **DeepL**: Translation fallback service
+
+### Key Features
+- **JWT Blacklisting**: Secure logout with token invalidation
+- **Request-scoped Logging**: Structured logs with request IDs
+- **Circuit Breaker**: Resilient external API calls
+- **Graceful Degradation**: Fallbacks when external services are unavailable
+- **Rate Limiting**: Protection against abuse
+- **CORS Configuration**: Secure cross-origin requests
