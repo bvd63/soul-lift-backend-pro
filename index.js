@@ -28,6 +28,8 @@ import * as Sentry from "@sentry/node";
 import fs from "fs";
 import dotenv from "dotenv";
 import { cleanEnv, str, bool, num } from "envalid";
+import logger from "./src/utils/logger.js";
+import apiRetry from "./src/utils/apiRetry.js";
 
 // ---------- basic setup ----------
 dotenv.config();
@@ -120,7 +122,7 @@ const normText = (s) => (s || "").toLowerCase().replace(/\\s+/g, " ").trim();
 
 // Folosim sistemul avansat de retry pentru apeluri API
 // Folosim fetch direct în loc de fetchWithRetry pentru simplitate
-const fetchWithRetry = fetch;
+const fetchWithRetry = apiRetry.fetchWithRetry;
 
 // ---------- plugins ----------
 const allowedOrigins = (env.CORS_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
@@ -141,6 +143,7 @@ await app.register(swagger, { openapi: { info: { title: "SoulLift API", version:
 await app.register(swaggerUI, { routePrefix: "/docs" });
 await app.register(metrics, { endpoint: "/metrics", defaultMetrics: { enabled: true } });
 await app.register(fastifyRawBody, { field: "rawBody", global: false, runFirst: true });
+await app.register(logger.fastifyPlugin, { logLevel: isProd ? "info" : "debug" });
 // Global error handler
 app.setErrorHandler((err, req, rep) => {
   app.log.error({ err }, "Unhandled error");
@@ -188,6 +191,28 @@ const ensureTables = async () => {
       created_at timestamptz default now()
     );
   `);
+  // Preferințe notificări per utilizator
+  await query(`
+    create table if not exists notification_preferences (
+      email text primary key references users(email) on delete cascade,
+      topics jsonb default '[]',
+      mute boolean default false,
+      quiet_hours jsonb, -- {"start":"22:00","end":"08:00","timezone":"Europe/Bucharest"}
+      updated_at timestamptz default now()
+    );
+  `);
+  // Inbox notificări (vizibil în app)
+  await query(`
+    create table if not exists notifications_inbox (
+      id bigserial primary key,
+      email text references users(email) on delete cascade,
+      title text,
+      body text,
+      data jsonb,
+      read boolean default false,
+      created_at timestamptz default now()
+    );
+  `);
   await query(`
     create table if not exists ai_quotes (
       id bigserial primary key,
@@ -216,6 +241,37 @@ async function pushAudit(type, email, meta) {
     await query(`insert into audit_log(type,email,meta) values($1,$2,$3)`,
       [type, email, meta ? JSON.stringify(meta) : null]);
   } catch (e) { app.log.warn("audit error", e); }
+}
+
+// ---------- notify preferences helpers ----------
+function parseTimeHM(str) {
+  const [h, m] = (str || "").split(":").map(x => parseInt(x, 10));
+  return isNaN(h) ? null : (h * 60 + (isNaN(m) ? 0 : m));
+}
+function isQuietNow(pref) {
+  if (!pref || !pref.quiet_hours || !pref.quiet_hours.start || !pref.quiet_hours.end) return false;
+  const now = new Date();
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  const start = parseTimeHM(pref.quiet_hours.start);
+  const end = parseTimeHM(pref.quiet_hours.end);
+  if (start === null || end === null) return false;
+  // Interval poate trece peste miezul nopții
+  if (start <= end) {
+    return minutes >= start && minutes < end;
+  } else {
+    return minutes >= start || minutes < end;
+  }
+}
+async function getNotificationPrefs(email) {
+  try {
+    const { rows } = await query(`select topics, mute, quiet_hours from notification_preferences where email=$1`, [email]);
+    if (rows[0]) return {
+      topics: rows[0].topics || [],
+      mute: !!rows[0].mute,
+      quiet_hours: rows[0].quiet_hours || null
+    };
+  } catch {}
+  return { topics: [], mute: false, quiet_hours: null };
 }
 
 // ---------- auth helpers ----------
@@ -304,6 +360,9 @@ const PREMIUM_COLLECTIONS = [
   { id: "stoicism", name: "Stoicism Starter", items: ["q4"] },
   { id: "deep-focus", name: "Deep Focus", items: ["q2", "q3"] },
 ];
+
+// Meta pentru caching la /api/quote
+let quotesLastMod = Date.now();
 
 // ---------- AI helpers (guarded) ----------
 function aiEnabled() { return USE_OPENAI && !!OPENAI_KEY; }
@@ -464,23 +523,132 @@ app.get("/", async () => ({ ok: true }));
 app.get("/favicon.ico", async (req, rep) => rep.code(204).send());
 
 // health & config
-app.get("/health", async () => ({ ok: true, ts: Date.now() }));
-app.get("/healthz", async () => ({ ok: true, ts: Date.now() }));
-app.get("/config", async () => ({
+app.get("/health", {
+  schema: {
+    tags: ['System'],
+    summary: 'Health check',
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, ts: { type: 'integer' } } } }
+  }
+}, async () => ({ ok: true, ts: Date.now() }));
+app.get("/healthz", {
+  schema: {
+    tags: ['System'],
+    summary: 'Health check (alias)',
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, ts: { type: 'integer' } } } }
+  }
+}, async () => ({ ok: true, ts: Date.now() }));
+app.get("/config", {
+  preHandler: [(req, rep, done) => { rep.header('Sunset', 'Wed, 31 Dec 2025 00:00:00 GMT'); done(); }],
+  schema: {
+    tags: ['System'],
+    summary: 'Runtime feature flags',
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          features: {
+            type: 'object',
+            properties: {
+              openai: { type: 'boolean' },
+              deepl: { type: 'boolean' },
+              fcm: { type: 'boolean' },
+              sentry: { type: 'boolean' },
+              ai_recommendations: { type: 'boolean' }
+            }
+          }
+        }
+      }
+    }
+  }
+}, async () => ({
   ok: true,
   features: {
     openai: aiEnabled(), deepl: Boolean(DEEPL_KEY),
     fcm: Boolean(FIREBASE_PROJECT_ID && FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY),
     sentry: Boolean(process.env.SENTRY_DSN),
+    ai_recommendations: aiEnabled(),
+  },
+}));
+
+// /v1 alias for config
+app.get("/v1/config", {
+  schema: {
+    tags: ['System'],
+    summary: 'Runtime feature flags (v1)',
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          features: {
+            type: 'object',
+            properties: {
+              openai: { type: 'boolean' },
+              deepl: { type: 'boolean' },
+              fcm: { type: 'boolean' },
+              sentry: { type: 'boolean' },
+              ai_recommendations: { type: 'boolean' }
+            }
+          }
+        }
+      }
+    }
+  }
+}, async () => ({
+  ok: true,
+  features: {
+    openai: aiEnabled(), deepl: Boolean(DEEPL_KEY),
+    fcm: Boolean(FIREBASE_PROJECT_ID && FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY),
+    sentry: Boolean(process.env.SENTRY_DSN),
+    ai_recommendations: aiEnabled(),
   },
 }));
 
 // languages
-app.get("/api/languages", async () =>
-  ({ ok: true, languages: ["EN", "RO", "FR", "DE", "ES", "IT", "PT", "RU", "JA", "ZH", "NL", "PL", "TR"] }));
+app.get("/api/languages", {
+  schema: {
+    tags: ['System'],
+    summary: 'Supported languages',
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          languages: { type: 'array', items: { type: 'string' }, minItems: 1 }
+        }
+      }
+    }
+  }
+}, async () => ({ ok: true, languages: ["EN", "RO", "FR", "DE", "ES", "IT", "PT", "RU", "JA", "ZH", "NL", "PL", "TR"] }));
 
 // auth
-app.post("/api/register", async (req, rep) => {
+app.post("/api/register", {
+  schema: {
+    tags: ['Auth'],
+    summary: 'Înregistrare utilizator',
+    body: {
+      type: 'object',
+      properties: {
+        email: { type: 'string', format: 'email' },
+        password: { type: 'string', minLength: 6, maxLength: 128 }
+      },
+      required: ['email', 'password']
+    },
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          user: { type: 'object', properties: { email: { type: 'string', format: 'email' } } },
+          tokens: { type: 'object', properties: { access: { type: 'string' }, refresh: { type: 'string' } } }
+        }
+      },
+      400: { type: 'object', properties: { error: { type: 'string' } } },
+      409: { type: 'object', properties: { error: { type: 'string' } } }
+    }
+  }
+}, async (req, rep) => {
   const { email, password } = req.body || {};
   if (!email || !password) return rep.code(400).send({ error: "Email and password required." });
   const { rows } = await query(`select * from users where email=$1`, [email]);
@@ -494,7 +662,33 @@ app.post("/api/register", async (req, rep) => {
   return { ok: true, user: { email }, tokens: { access, refresh } };
 });
 
-app.post("/api/login", { config: { rateLimit: { max: 10, timeWindow: '1m' } } }, async (req, rep) => {
+app.post("/api/login", {
+  config: { rateLimit: { max: 10, timeWindow: '1m' } },
+  schema: {
+    tags: ['Auth'],
+    summary: 'Autentificare utilizator',
+    body: {
+      type: 'object',
+      properties: {
+        email: { type: 'string', format: 'email' },
+        password: { type: 'string', minLength: 6, maxLength: 128 },
+        remember: { type: 'boolean', default: false }
+      },
+      required: ['email', 'password']
+    },
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          user: { type: 'object', properties: { email: { type: 'string', format: 'email' } } },
+          tokens: { type: 'object', properties: { access: { type: 'string' }, refresh: { type: 'string' } } }
+        }
+      },
+      401: { type: 'object', properties: { error: { type: 'string' } } }
+    }
+  }
+}, async (req, rep) => {
   const { email, password, remember = false } = req.body || {};
   if (!email || !password) return rep.code(400).send({ error: "Email and password required." });
   const { rows } = await query(`select * from users where email=$1`, [email]);
@@ -511,7 +705,26 @@ app.post("/api/login", { config: { rateLimit: { max: 10, timeWindow: '1m' } } },
   return { ok: true, user: { email, badges: user.badges || [] }, tokens: { access, refresh } };
 });
 
-app.post("/api/refresh", { config: { rateLimit: { max: 20, timeWindow: '1m' } } }, async (req, rep) => {
+app.post("/api/refresh", {
+  config: { rateLimit: { max: 20, timeWindow: '1m' } },
+  schema: {
+    tags: ['Auth'],
+    summary: 'Reîmprospătare token',
+    body: {
+      type: 'object',
+      properties: { token: { type: 'string' } },
+      required: ['token']
+    },
+    response: {
+      200: {
+        type: 'object',
+        properties: { ok: { type: 'boolean' }, accessToken: { type: 'string' }, refreshToken: { type: 'string' } }
+      },
+      400: { type: 'object', properties: { error: { type: 'string' } } },
+      401: { type: 'object', properties: { error: { type: 'string' } } }
+    }
+  }
+}, async (req, rep) => {
   const { token } = req.body || {};
   if (!token) return rep.code(400).send({ error: "Missing token" });
   const valid = await isRefreshTokenValid(token);
@@ -527,7 +740,22 @@ app.post("/api/refresh", { config: { rateLimit: { max: 20, timeWindow: '1m' } } 
 });
 
 // categories & quotes
-app.get("/api/categories", async (req, rep) => {
+app.get("/api/categories", {
+  preHandler: [(req, rep, done) => { rep.header('Sunset', 'Wed, 31 Dec 2025 00:00:00 GMT'); done(); }],
+  schema: {
+    tags: ['Content'],
+    summary: 'Listează categoriile',
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          categories: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, premium: { type: 'boolean' } }, required: ['id','name','premium'] } }
+        }
+      }
+    }
+  }
+}, async (req, rep) => {
   // Conditional GET using ETag and Last-Modified
   const inm = req.headers["if-none-match"];
   const ims = req.headers["if-modified-since"];
@@ -553,7 +781,54 @@ app.get("/api/categories", async (req, rep) => {
   rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
   return { ok: true, categories };
 });
-app.get("/api/quote", async (req, rep) => {
+
+// /v1 alias for categories
+app.get("/v1/categories", {
+  schema: {
+    tags: ['Content'],
+    summary: 'Listează categoriile (v1)',
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          categories: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, premium: { type: 'boolean' } }, required: ['id','name','premium'] } }
+        }
+      }
+    }
+  }
+}, async (req, rep) => {
+  const inm = req.headers["if-none-match"];
+  const ims = req.headers["if-modified-since"];
+  if (categoriesETag && inm === categoriesETag) {
+    rep.header("ETag", categoriesETag);
+    if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
+    rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
+    return rep.code(304).send();
+  }
+  if (categoriesLastMod && ims) {
+    const since = new Date(ims).getTime();
+    if (!Number.isNaN(since) && since >= categoriesLastMod) {
+      if (categoriesETag) rep.header("ETag", categoriesETag);
+      rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
+      rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
+      return rep.code(304).send();
+    }
+  }
+  if (categoriesETag) rep.header("ETag", categoriesETag);
+  if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
+  rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
+  return { ok: true, categories };
+});
+app.get("/api/quote", {
+  preHandler: [(req, rep, done) => { rep.header('Sunset', 'Wed, 31 Dec 2025 00:00:00 GMT'); done(); }],
+  schema: {
+    tags: ['Content'],
+    summary: 'Obține un citat random (respectă pro/free)',
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, quote: { type: 'object' } } } }
+  }
+}, async (req, rep) => {
+  const lang = (req.query?.lang || "default").toLowerCase();
   let email = null;
   try { const a = req.headers.authorization; if (a) email = jwt.verify(a.split(" ")[1], JWT_SECRET).email; } catch {}
   let isPro = false;
@@ -564,17 +839,77 @@ app.get("/api/quote", async (req, rep) => {
   const pool = QUOTES.filter(q => isPro ? true : !q.premium);
   const q = pool[Math.floor(Math.random() * pool.length)];
   await pushAudit("quote:served", email, { quoteId: q.id });
+  const etag = `W/"quote-${q.id}-${lang}"`;
+  const inm = req.headers["if-none-match"];
+  if (inm && inm === etag) {
+    rep.header("ETag", etag);
+    if (quotesLastMod) rep.header("Last-Modified", new Date(quotesLastMod).toUTCString());
+    rep.header("Cache-Control", "public, max-age=0, must-revalidate");
+    return rep.code(304).send();
+  }
+  if (quotesLastMod) rep.header("Last-Modified", new Date(quotesLastMod).toUTCString());
+  rep.header("ETag", etag);
+  rep.header("Cache-Control", "public, max-age=0, must-revalidate");
+  return { ok: true, quote: q };
+});
+
+// /v1 alias for quote
+app.get("/v1/quote", {
+  schema: {
+    tags: ['Content'],
+    summary: 'Obține un citat random (v1)',
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, quote: { type: 'object' } } } }
+  }
+}, async (req, rep) => {
+  const lang = (req.query?.lang || "default").toLowerCase();
+  let email = null;
+  try { const a = req.headers.authorization; if (a) email = jwt.verify(a.split(" ")[1], JWT_SECRET).email; } catch {}
+  let isPro = false;
+  if (email) {
+    const { rows } = await query(`select subscription_status from users where email=$1`, [email]);
+    isPro = rows[0]?.subscription_status === "active";
+  }
+  const pool = QUOTES.filter(q => isPro ? true : !q.premium);
+  const q = pool[Math.floor(Math.random() * pool.length)];
+  await pushAudit("quote:served", email, { quoteId: q.id });
+  const etag = `W/"quote-${q.id}-${lang}"`;
+  const inm = req.headers["if-none-match"];
+  if (inm && inm === etag) {
+    rep.header("ETag", etag);
+    if (quotesLastMod) rep.header("Last-Modified", new Date(quotesLastMod).toUTCString());
+    rep.header("Cache-Control", "public, max-age=0, must-revalidate");
+    return rep.code(304).send();
+  }
+  if (quotesLastMod) rep.header("Last-Modified", new Date(quotesLastMod).toUTCString());
+  rep.header("ETag", etag);
+  rep.header("Cache-Control", "public, max-age=0, must-revalidate");
   return { ok: true, quote: q };
 });
 
 // AI export (read-only)
-app.get("/api/ai/export", async () => {
+app.get("/api/ai/export", {
+  schema: {
+    tags: ['AI'],
+    summary: 'Export ultimele citate AI',
+    response: {
+      200: { type: 'object', properties: { ok: { type: 'boolean' }, quotes: { type: 'array' } } }
+    }
+  }
+}, async () => {
   const { rows } = await query(`select id,text,tags,score,created_at from ai_quotes order by created_at desc limit 200`);
   return { ok: true, quotes: rows };
 });
 
 // favorites
-app.post("/api/favorites/toggle", { preHandler: [authMiddleware] }, async (req, rep) => {
+app.post("/api/favorites/toggle", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Favorites'],
+    summary: 'Comută preferința pe un citat',
+    body: { type: 'object', properties: { quoteId: { type: 'integer', minimum: 1 } }, required: ['quoteId'] },
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' } } } }
+  }
+}, async (req, rep) => {
   const { quoteId } = req.body || {};
   if (!quoteId) return rep.code(400).send({ error: "quoteId required" });
   const email = req.user.email;
@@ -584,7 +919,14 @@ app.post("/api/favorites/toggle", { preHandler: [authMiddleware] }, async (req, 
   await pushAudit("favorite:toggle", email, { quoteId });
   return { ok: true };
 });
-app.get("/api/favorites", { preHandler: [authMiddleware] }, async (req) => {
+app.get("/api/favorites", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Favorites'],
+    summary: 'Listă preferințe utilizator',
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, items: { type: 'array' } } } }
+  }
+}, async (req) => {
   const email = req.user.email;
   const { rows } = await query(`select quote_id from favorites where email=$1`, [email]);
   return { ok: true, items: rows.map(r => QUOTES.find(q => q.id === r.quote_id)).filter(Boolean) };
@@ -832,7 +1174,14 @@ function removeDuplicates(results) {
 }
 
 // translate
-app.post("/api/translate", async (req, rep) => {
+app.post("/api/translate", {
+  schema: {
+    tags: ['Utils'],
+    summary: 'Tradu un text',
+    body: { type: 'object', properties: { text: { type: 'string', minLength: 1 }, targetLang: { type: 'string', default: 'EN' } }, required: ['text'] },
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, translated: { type: 'string' } } } }
+  }
+}, async (req, rep) => {
   const { text, targetLang = "EN" } = req.body || {};
   if (!text) return rep.code(400).send({ error: "text required" });
   const t = await translateText(text, targetLang);
@@ -880,7 +1229,16 @@ async function translateText(text, targetLang = "EN") {
 }
 
 // ---------- Stripe billing ----------
-app.post("/api/billing/checkout", { preHandler: [authMiddleware] }, async (req, rep) => {
+app.post("/api/billing/checkout", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Billing'],
+    summary: 'Creează sesiune de checkout Stripe',
+    body: { type: 'object', properties: { plan: { type: 'string', enum: ['monthly','yearly'], default: 'monthly' } } },
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, url: { type: 'string', format: 'uri' } } },
+               500: { type: 'object', properties: { error: { type: 'string' } } } }
+  }
+}, async (req, rep) => {
   const { plan = "monthly" } = req.body || {};
   const priceId = plan === "yearly" ? STRIPE_PRICE_ID_YEARLY : STRIPE_PRICE_ID_MONTHLY;
   if (!priceId) return rep.code(500).send({ error: "Price not configured." });
@@ -905,10 +1263,20 @@ app.post("/api/billing/checkout", { preHandler: [authMiddleware] }, async (req, 
   return { ok: true, url: session.url };
 });
 
-app.get("/api/billing/portal", { preHandler: [authMiddleware] }, async (req) => {
+app.get("/api/billing/portal", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Billing'],
+    summary: 'Stripe customer portal session',
+    response: {
+      200: { type: 'object', properties: { ok: { type: 'boolean' }, url: { type: 'string', format: 'uri' } } },
+      400: { type: 'object', properties: { error: { type: 'string' } } }
+    }
+  }
+}, async (req, rep) => {
   const { rows } = await query(`select stripe_customer_id from users where email=$1`, [req.user.email]);
   const customerId = rows[0]?.stripe_customer_id;
-  if (!customerId) return { ok: false, error: "No Stripe customer" };
+  if (!customerId) return rep.code(400).send({ error: "No Stripe customer" });
   const portal = await stripe.billingPortal.sessions.create({ customer: customerId, return_url: `${FRONTEND_URL}/account` });
   return { ok: true, url: portal.url };
 });
@@ -917,6 +1285,16 @@ app.route({
   method: "POST",
   url: "/api/stripe/webhook",
   config: { rawBody: true },
+  schema: {
+    tags: ['Billing'],
+    summary: 'Stripe Webhook',
+    headers: {
+      type: 'object',
+      properties: { 'stripe-signature': { type: 'string' } },
+      required: ['stripe-signature']
+    },
+    response: { 200: { type: 'object', properties: { received: { type: 'boolean' } } }, 400: { type: 'object', properties: { error: { type: 'string' } } } }
+  },
   handler: async (req, rep) => {
     const sig = req.headers["stripe-signature"];
     let event;
@@ -960,7 +1338,7 @@ async function getGoogleAccessToken() {
     scope: "https://www.googleapis.com/auth/firebase.messaging",
   };
   const assertion = jwtLib.sign(claim, FIREBASE_PRIVATE_KEY, { algorithm: "RS256", header });
-  const res = await fetch("https://oauth2.googleapis.com/token", {
+  const res = await fetchWithRetry("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion }),
@@ -976,7 +1354,7 @@ async function fcmSendV1(tokens = [], { title = "SoulLift", body = "Hi", data = 
   let sent = 0;
   for (const t of tokens) {
     const payload = { message: { token: t, notification: { title, body }, data: Object.fromEntries(Object.entries(data).map(([k, v]) => [String(k), String(v)])) } };
-    const r = await fetch(url, { method: "POST", headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  const r = await fetchWithRetry(url, { method: "POST", headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     if (r.ok) sent++;
     else {
       const txt = await r.text().catch(() => "");
@@ -986,14 +1364,37 @@ async function fcmSendV1(tokens = [], { title = "SoulLift", body = "Hi", data = 
   }
   return sent;
 }
-app.post("/api/notify/register", { preHandler: [authMiddleware] }, async (req, rep) => {
+app.post("/api/notify/register", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Notify'],
+    summary: 'Înregistrează token push pentru utilizator',
+    body: { type: 'object', properties: { token: { type: 'string', minLength: 10 } }, required: ['token'] },
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' } } }, 400: { type: 'object', properties: { error: { type: 'string' } } } }
+  }
+}, async (req, rep) => {
   const { token } = req.body || {};
   if (!token) return rep.code(400).send({ error: "token required" });
   await query(`insert into push_tokens(email,token) values($1,$2) on conflict(token) do update set email=EXCLUDED.email`, [req.user.email, token]);
   await pushAudit("notify:register", req.user.email, null);
   return { ok: true };
 });
-app.post("/api/notify/test", { preHandler: [authMiddleware] }, async (req, rep) => {
+app.post("/api/notify/test", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Notify'],
+    summary: 'Trimite push test către token-urile utilizatorului',
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, sent: { type: 'integer', minimum: 0 } } }, 400: { type: 'object', properties: { error: { type: 'string' } } } }
+  }
+}, async (req, rep) => {
+  if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
+    return rep.code(400).send({ error: "FCM not configured" });
+  }
+  const prefs = await getNotificationPrefs(req.user.email);
+  if (prefs.mute || isQuietNow(prefs)) {
+    await pushAudit("notify:test:muted", req.user.email, { mute: prefs.mute, quiet: isQuietNow(prefs) });
+    return { ok: true, sent: 0 };
+  }
   const { rows } = await query(`select token from push_tokens where email=$1`, [req.user.email]);
   const tokens = rows.map(r => r.token);
   if (!tokens.length) return rep.code(400).send({ error: "No tokens" });
@@ -1001,8 +1402,23 @@ app.post("/api/notify/test", { preHandler: [authMiddleware] }, async (req, rep) 
   await pushAudit("notify:test", req.user.email, { sent });
   return { ok: true, sent };
 });
-app.post("/api/notify/broadcast", async (req, rep) => {
-  const { title = "SoulLift", body = "Hello!", proOnly = true } = req.body || {};
+app.post("/api/notify/broadcast", {
+  schema: {
+    tags: ['Notify'],
+    summary: 'Broadcast push notification',
+    body: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', minLength: 1 },
+        body: { type: 'string', minLength: 1 },
+        proOnly: { type: 'boolean' },
+        topic: { type: 'string' }
+      }
+    },
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, sent: { type: 'integer', minimum: 0 } } } }
+  }
+}, async (req, rep) => {
+  const { title = "SoulLift", body = "Hello!", proOnly = true, topic = null } = req.body || {};
   const { rows } = await query(`select email, token from push_tokens`);
   const groups = {};
   for (const r of rows) { groups[r.email] = groups[r.email] || []; groups[r.email].push(r.token); }
@@ -1012,7 +1428,101 @@ app.post("/api/notify/broadcast", async (req, rep) => {
       const { rows: urows } = await query(`select subscription_status from users where email=$1`, [email]);
       if (urows[0]?.subscription_status !== "active") continue;
     }
-    try { total += await fcmSendV1(groups[email], { title, body, data: { type: "broadcast" } }); await sleep(100); }
+    const prefs = await getNotificationPrefs(email);
+    // Adaugăm în inbox indiferent de preferințe (util pentru vizualizare în app)
+    try { await query(`insert into notifications_inbox(email,title,body,data) values($1,$2,$3,$4)`, [email, title, body, JSON.stringify({ type: "broadcast", topic: topic || undefined })]); } catch {}
+    if (prefs.mute || isQuietNow(prefs)) continue;
+    if (topic && Array.isArray(prefs.topics) && prefs.topics.length && !prefs.topics.includes(topic)) continue;
+    try { total += await fcmSendV1(groups[email], { title, body, data: { type: "broadcast", topic: topic || undefined } }); await sleep(100); }
+    catch (e) { app.log.warn("broadcast err", e); }
+  }
+  await pushAudit("notify:broadcast", null, { total });
+  return { ok: true, sent: total };
+});
+
+// Preferințe notificări - CRUD
+app.get("/api/notify/preferences", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Notify'],
+    summary: 'Obține preferințele de notificare',
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, preferences: { type: 'object' } } } }
+  }
+}, async (req) => {
+  const prefs = await getNotificationPrefs(req.user.email);
+  return { ok: true, preferences: prefs };
+});
+app.post("/api/notify/preferences", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Notify'],
+    summary: 'Setează preferințele de notificare',
+    body: { type: 'object', properties: { topics: { type: 'array', items: { type: 'string' } }, mute: { type: 'boolean' }, quiet_hours: { type: 'object', properties: { start: { type: 'string' }, end: { type: 'string' }, timezone: { type: 'string' } } } } },
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' } } } }
+  }
+}, async (req) => {
+  const { topics = [], mute = false, quiet_hours = null } = req.body || {};
+  await query(`insert into notification_preferences(email, topics, mute, quiet_hours)
+               values($1,$2,$3,$4)
+               on conflict(email) do update set topics=EXCLUDED.topics, mute=EXCLUDED.mute, quiet_hours=EXCLUDED.quiet_hours, updated_at=now()`,
+               [req.user.email, JSON.stringify(topics), mute, quiet_hours ? JSON.stringify(quiet_hours) : null]);
+  await pushAudit("notify:prefs:update", req.user.email, null);
+  return { ok: true };
+});
+
+// Inbox notificări
+app.get("/api/notify/inbox", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Notify'],
+    summary: 'Inbox notificări pentru utilizator',
+    querystring: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, default: 20 }, offset: { type: 'integer', minimum: 0, default: 0 } } },
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, items: { type: 'array' }, total: { type: 'integer' } } } }
+  }
+}, async (req) => {
+  const { limit = 20, offset = 0 } = req.query || {};
+  const { rows } = await query(`select id,title,body,data,read,created_at from notifications_inbox where email=$1 order by created_at desc limit $2 offset $3`, [req.user.email, limit, offset]);
+  const { rows: c } = await query(`select count(*)::int as cnt from notifications_inbox where email=$1`, [req.user.email]);
+  return { ok: true, items: rows, total: c[0]?.cnt || 0 };
+});
+app.post("/api/notify/inbox/read", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Notify'],
+    summary: 'Marchează notificările ca citite',
+    body: { type: 'object', properties: { id: { type: 'integer' }, all: { type: 'boolean' } } },
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, updated: { type: 'integer' } } } }
+  }
+}, async (req) => {
+  const { id = null, all = false } = req.body || {};
+  let res;
+  if (all) {
+    res = await query(`update notifications_inbox set read=true where email=$1 and read=false`, [req.user.email]);
+  } else if (id) {
+    res = await query(`update notifications_inbox set read=true where email=$1 and id=$2`, [req.user.email, id]);
+  } else {
+    return { ok: true, updated: 0 };
+  }
+  await pushAudit("notify:inbox:read", req.user.email, { id, all });
+  return { ok: true, updated: res.rowCount || 0 };
+});
+app.post("/api/notify/broadcast", async (req, rep) => {
+  const { title = "SoulLift", body = "Hello!", proOnly = true, topic = null } = req.body || {};
+  const { rows } = await query(`select email, token from push_tokens`);
+  const groups = {};
+  for (const r of rows) { groups[r.email] = groups[r.email] || []; groups[r.email].push(r.token); }
+  let total = 0;
+  for (const email of Object.keys(groups)) {
+    if (proOnly) {
+      const { rows: urows } = await query(`select subscription_status from users where email=$1`, [email]);
+      if (urows[0]?.subscription_status !== "active") continue;
+    }
+    const prefs = await getNotificationPrefs(email);
+    // Adaugăm în inbox indiferent de preferințe (util pentru vizualizare în app)
+    try { await query(`insert into notifications_inbox(email,title,body,data) values($1,$2,$3,$4)`, [email, title, body, JSON.stringify({ type: "broadcast", topic: topic || undefined })]); } catch {}
+    if (prefs.mute || isQuietNow(prefs)) continue;
+    if (topic && Array.isArray(prefs.topics) && prefs.topics.length && !prefs.topics.includes(topic)) continue;
+    try { total += await fcmSendV1(groups[email], { title, body, data: { type: "broadcast", topic: topic || undefined } }); await sleep(100); }
     catch (e) { app.log.warn("broadcast err", e); }
   }
   await pushAudit("notify:broadcast", null, { total });
@@ -1033,7 +1543,7 @@ cron.schedule("15 8 * * *", async () => {
     const { rows } = await query(`select email from users where subscription_status='past_due'`);
     for (const r of rows) {
       if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  await fetchWithRetry(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: `Dunning: ${r.email}` }),
         });
@@ -1048,7 +1558,7 @@ cron.schedule("0 9 * * *", async () => {
     const { rows } = await query(`select email from users where (last_login is null or last_login < $1) and subscription_status!='pro'`, [cutoff]);
     for (const r of rows) {
       if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  await fetchWithRetry(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: `Winback candidate: ${r.email}` }),
         });
@@ -1108,7 +1618,7 @@ cron.schedule("30 7 * * *", async () => {
     }
     const msg = lines.join("\\n");
     if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-      await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  await fetchWithRetry(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg }),
       });
@@ -1117,10 +1627,21 @@ cron.schedule("30 7 * * *", async () => {
 }, { timezone: "Europe/Bucharest" });
 
 // ---------- admin/test & export ----------
-app.post("/admin/telegram/test", async (req, rep) => {
+app.post("/admin/telegram/test", {
+  schema: {
+    tags: ['Admin'],
+    summary: 'Send test Telegram message',
+    body: { type: 'object', properties: { text: { type: 'string', minLength: 1, maxLength: 500 } } },
+    response: {
+      200: { type: 'object', properties: { ok: { type: 'boolean' } } },
+      400: { type: 'object', properties: { error: { type: 'string' } } },
+      500: { type: 'object', properties: { error: { type: 'string' } } }
+    }
+  }
+}, async (req, rep) => {
   const { text = "SoulLift test message" } = req.body || {};
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return rep.code(400).send({ error: "Telegram not configured" });
-  const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const r = await fetchWithRetry(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text }),
   });
@@ -1128,7 +1649,16 @@ app.post("/admin/telegram/test", async (req, rep) => {
   return { ok: true };
 });
 
-app.get("/admin/export/json", async (req, rep) => {
+app.get("/admin/export/json", {
+  schema: {
+    tags: ['Admin'],
+    summary: 'Export data to JSON file',
+    response: {
+      200: { type: 'object', properties: { ok: { type: 'boolean' }, path: { type: 'string' } } },
+      500: { type: 'object', properties: { error: { type: 'string' } } }
+    }
+  }
+}, async (req, rep) => {
   try {
     const users = await query(`select email, created_at, badges, streak, last_login, subscription_status, subscription_tier from users`);
     const favs = await query(`select * from favorites`);
@@ -1140,11 +1670,206 @@ app.get("/admin/export/json", async (req, rep) => {
   } catch (e) { app.log.error("export err", e); return rep.code(500).send({ error: "export failed" }); }
 });
 
-app.get("/api/stats", async () => {
+app.get("/api/stats", {
+  schema: {
+    tags: ['System'],
+    summary: 'System statistics',
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          stats: {
+            type: 'object',
+            properties: {
+              users: { type: 'integer', minimum: 0 },
+              ai_quotes: { type: 'integer', minimum: 0 },
+              favorites: { type: 'integer', minimum: 0 }
+            }
+          }
+        }
+      }
+    }
+  }
+}, async () => {
   const q1 = await query(`select count(*) as users from users`);
   const q2 = await query(`select count(*) as ai_quotes from ai_quotes`);
   const q3 = await query(`select count(*) as favorites from favorites`);
-  return { ok: true, stats: { users: q1.rows[0].users, ai_quotes: q2.rows[0].ai_quotes, favorites: q3.rows[0].favorites } };
+  return { ok: true, stats: { users: Number(q1.rows[0].users || 0), ai_quotes: Number(q2.rows[0].ai_quotes || 0), favorites: Number(q3.rows[0].favorites || 0) } };
+});
+
+// ---------- GDPR endpoints ----------
+app.get("/api/gdpr/export", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['GDPR'],
+    summary: 'Exportă datele personale (GDPR)',
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          data: { type: 'object' }
+        }
+      },
+      404: { type: 'object', properties: { error: { type: 'string' } } }
+    }
+  }
+}, async (req, rep) => {
+  const email = req.user.email;
+  try {
+    const user = (await query(
+      `select email, created_at, badges, streak, last_login, subscription_status, subscription_tier, stripe_customer_id, stripe_sub_id, current_period_end from users where email=$1`,
+      [email]
+    )).rows[0];
+    if (!user) return rep.code(404).send({ error: "Utilizator inexistent" });
+
+    const favorites = (await query(
+      `select quote_id, created_at from favorites where email=$1 order by created_at desc`,
+      [email]
+    )).rows;
+    const pushTokens = (await query(
+      `select token, created_at from push_tokens where email=$1 order by created_at desc`,
+      [email]
+    )).rows;
+    const prefs = (await query(
+      `select email, topics, mute, quiet_hours, updated_at from notification_preferences where email=$1`,
+      [email]
+    )).rows[0] || null;
+    const inbox = (await query(
+      `select id, title, body, data, read, created_at from notifications_inbox where email=$1 order by created_at desc limit 200`,
+      [email]
+    )).rows;
+    const audit = (await query(
+      `select id, ts, type, meta from audit_log where email=$1 order by ts desc limit 200`,
+      [email]
+    )).rows;
+
+    await pushAudit("gdpr:export", email, { items: { favorites: favorites.length, push_tokens: pushTokens.length, inbox: inbox.length, audit: audit.length } });
+    return { ok: true, data: { user, favorites, push_tokens: pushTokens, notification_preferences: prefs, inbox, audit_log: audit } };
+  } catch (e) {
+    app.log.error(e);
+    return rep.code(500).send({ error: "Export error" });
+  }
+});
+
+app.post("/api/gdpr/delete", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['GDPR'],
+    summary: 'Șterge datele personale (GDPR)',
+    body: {
+      type: 'object',
+      properties: { confirm: { type: 'boolean' } },
+      required: ['confirm']
+    },
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          deleted: { type: 'object' }
+        }
+      },
+      404: { type: 'object', properties: { error: { type: 'string' } } }
+    }
+  }
+}, async (req, rep) => {
+  const email = req.user.email;
+  const { confirm } = req.body || {};
+  if (!confirm) return rep.code(400).send({ error: "Confirmă ștergerea" });
+  try {
+    const exists = (await query(`select 1 from users where email=$1`, [email])).rows[0];
+    if (!exists) return rep.code(404).send({ error: "Utilizator inexistent" });
+
+    const favCount = (await query(`select count(*)::int as c from favorites where email=$1`, [email])).rows[0]?.c || 0;
+    const tokCount = (await query(`select count(*)::int as c from push_tokens where email=$1`, [email])).rows[0]?.c || 0;
+    const prefCount = (await query(`select count(*)::int as c from notification_preferences where email=$1`, [email])).rows[0]?.c || 0;
+    const inboxCount = (await query(`select count(*)::int as c from notifications_inbox where email=$1`, [email])).rows[0]?.c || 0;
+    const auditCount = (await query(`select count(*)::int as c from audit_log where email=$1`, [email])).rows[0]?.c || 0;
+
+    // Delete user — cascades will remove dependent records
+    const delUser = await query(`delete from users where email=$1`, [email]);
+    // Anonymize audit logs (keep meta, remove email linkage)
+    const anonymized = (await query(`update audit_log set email=null where email=$1`, [email])).rowCount || 0;
+
+    await pushAudit("gdpr:delete", null, { email });
+    return {
+      ok: true,
+      deleted: {
+        users: delUser.rowCount || 0,
+        favorites: favCount,
+        push_tokens: tokCount,
+        preferences: prefCount,
+        inbox: inboxCount,
+        audit_anonymized: anonymized,
+        audit_linked_before: auditCount
+      }
+    };
+  } catch (e) {
+    app.log.error(e);
+    return rep.code(500).send({ error: "Delete error" });
+  }
+});
+
+// v1 aliases
+app.get("/v1/gdpr/export", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['GDPR'],
+    summary: 'Exportă datele personale (v1)',
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, data: { type: 'object' } } } }
+  }
+}, async (req, rep) => {
+  // Proxy to the same handler logic by reusing above queries
+  const email = req.user.email;
+  try {
+    const user = (await query(
+      `select email, created_at, badges, streak, last_login, subscription_status, subscription_tier, stripe_customer_id, stripe_sub_id, current_period_end from users where email=$1`,
+      [email]
+    )).rows[0];
+    if (!user) return rep.code(404).send({ error: "Utilizator inexistent" });
+    const favorites = (await query(`select quote_id, created_at from favorites where email=$1 order by created_at desc`, [email])).rows;
+    const pushTokens = (await query(`select token, created_at from push_tokens where email=$1 order by created_at desc`, [email])).rows;
+    const prefs = (await query(`select email, topics, mute, quiet_hours, updated_at from notification_preferences where email=$1`, [email])).rows[0] || null;
+    const inbox = (await query(`select id, title, body, data, read, created_at from notifications_inbox where email=$1 order by created_at desc limit 200`, [email])).rows;
+    const audit = (await query(`select id, ts, type, meta from audit_log where email=$1 order by ts desc limit 200`, [email])).rows;
+    await pushAudit("gdpr:export", email, { items: { favorites: favorites.length, push_tokens: pushTokens.length, inbox: inbox.length, audit: audit.length }, v: "v1" });
+    return { ok: true, data: { user, favorites, push_tokens: pushTokens, notification_preferences: prefs, inbox, audit_log: audit } };
+  } catch (e) {
+    app.log.error(e);
+    return rep.code(500).send({ error: "Export error" });
+  }
+});
+
+app.post("/v1/gdpr/delete", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['GDPR'],
+    summary: 'Șterge datele personale (v1)',
+    body: { type: 'object', properties: { confirm: { type: 'boolean' } }, required: ['confirm'] },
+    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, deleted: { type: 'object' } } } }
+  }
+}, async (req, rep) => {
+  const email = req.user.email;
+  const { confirm } = req.body || {};
+  if (!confirm) return rep.code(400).send({ error: "Confirmă ștergerea" });
+  try {
+    const exists = (await query(`select 1 from users where email=$1`, [email])).rows[0];
+    if (!exists) return rep.code(404).send({ error: "Utilizator inexistent" });
+    const favCount = (await query(`select count(*)::int as c from favorites where email=$1`, [email])).rows[0]?.c || 0;
+    const tokCount = (await query(`select count(*)::int as c from push_tokens where email=$1`, [email])).rows[0]?.c || 0;
+    const prefCount = (await query(`select count(*)::int as c from notification_preferences where email=$1`, [email])).rows[0]?.c || 0;
+    const inboxCount = (await query(`select count(*)::int as c from notifications_inbox where email=$1`, [email])).rows[0]?.c || 0;
+    const auditCount = (await query(`select count(*)::int as c from audit_log where email=$1`, [email])).rows[0]?.c || 0;
+    const delUser = await query(`delete from users where email=$1`, [email]);
+    const anonymized = (await query(`update audit_log set email=null where email=$1`, [email])).rowCount || 0;
+    await pushAudit("gdpr:delete", null, { email, v: "v1" });
+    return { ok: true, deleted: { users: delUser.rowCount || 0, favorites: favCount, push_tokens: tokCount, preferences: prefCount, inbox: inboxCount, audit_anonymized: anonymized, audit_linked_before: auditCount } };
+  } catch (e) {
+    app.log.error(e);
+    return rep.code(500).send({ error: "Delete error" });
+  }
 });
 
 // ---------- start ----------
