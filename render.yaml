@@ -1,5 +1,22 @@
 # render.yaml — SoulLift backend (Fastify + Stripe + OpenAI/DeepL + FCM v1 + Sentry)
 # Compatibil cu index.js (health: /health, cron intern, Stripe raw-body)
+envVarGroups:
+  - name: soullift-common
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CORS_ORIGINS
+        value: "http://localhost:5173"
+      - key: USE_OPENAI
+        value: "true"
+      - key: DEEPL_ENDPOINT
+        value: "https://api-free.deepl.com"
+      - key: SENTRY_DSN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_SSL
+        value: false
 
 services:
   - type: web
@@ -11,11 +28,14 @@ services:
     autoDeploy: true
     pullRequestPreviewsEnabled: false
 
+    envVarGroups:
+      - soullift-common
+
     buildCommand: "npm ci"
     startCommand: "node index.js"
 
     # Se potrivește cu rutele din index.js (există și /healthz ca alias)
-      healthCheckPath: /api/health
+    healthCheckPath: /api/health
     healthCheckTimeout: 100
 
     envVars:
