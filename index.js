@@ -383,22 +383,28 @@ async function openaiChat(messages, opts = {}) {
     temperature: opts.temperature ?? 0.5,
     max_tokens: opts.max_tokens ?? 150,
   };
-  const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  }, 3, 400);
-  const data = await res.json();
+  const data = await fetchWithRetry(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    { maxRetries: 3, initialDelay: 400 }
+  );
   return data?.choices?.[0]?.message?.content?.trim();
 }
 async function openaiEmbedding(text) {
   if (!aiEnabled()) return null;
-  const res = await fetchWithRetry("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "text-embedding-3-small", input: text }),
-  }, 3, 400);
-  const data = await res.json();
+  const data = await fetchWithRetry(
+    "https://api.openai.com/v1/embeddings",
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "text-embedding-3-small", input: text }),
+    },
+    { maxRetries: 3, initialDelay: 400 }
+  );
   return data?.data?.[0]?.embedding || null;
 }
 function cosine(a, b) {
@@ -484,12 +490,15 @@ async function generateAndStoreSingle() {
 
   // OpenAI moderation (best-effort)
   try {
-    const r = await fetchWithRetry("https://api.openai.com/v1/moderations", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "omni-moderation-latest", input: quote }),
-    });
-    const mod = await r.json();
+    const mod = await fetchWithRetry(
+      "https://api.openai.com/v1/moderations",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "omni-moderation-latest", input: quote }),
+      },
+      { maxRetries: 2, initialDelay: 400 }
+    );
     const allowed = !mod?.results?.[0]?.flagged;
     if (!allowed) return null;
   } catch (e) { app.log.warn("moderation fail", e); }
@@ -1346,12 +1355,15 @@ async function getGoogleAccessToken() {
     scope: "https://www.googleapis.com/auth/firebase.messaging",
   };
   const assertion = jwtLib.sign(claim, FIREBASE_PRIVATE_KEY, { algorithm: "RS256", header });
-  const res = await fetchWithRetry("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion }),
-  });
-  const data = await res.json();
+  const data = await fetchWithRetry(
+    "https://oauth2.googleapis.com/token",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion }),
+    },
+    { maxRetries: 2, initialDelay: 400 }
+  );
   if (!data.access_token) throw new Error("no access token");
   return data.access_token;
 }
@@ -1362,11 +1374,15 @@ async function fcmSendV1(tokens = [], { title = "SoulLift", body = "Hi", data = 
   let sent = 0;
   for (const t of tokens) {
     const payload = { message: { token: t, notification: { title, body }, data: Object.fromEntries(Object.entries(data).map(([k, v]) => [String(k), String(v)])) } };
-  const r = await fetchWithRetry(url, { method: "POST", headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    if (r.ok) sent++;
-    else {
-      const txt = await r.text().catch(() => "");
-      app.log.warn("fcm send failed", r.status, txt);
+    try {
+      await fetchWithRetry(
+        url,
+        { method: "POST", headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) },
+        { maxRetries: 2, initialDelay: 300 }
+      );
+      sent++;
+    } catch (e) {
+      app.log.warn("fcm send failed", e?.message || e);
     }
     await sleep(50);
   }
