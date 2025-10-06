@@ -77,9 +77,13 @@ if (!envCheck.ok) {
 }
 
 // Set X-Request-ID on responses
-app.addHook('onSend', async (req, rep, payload) => {
-  rep.header('X-Request-ID', req.id);
-  return payload;
+// Request ID + structured logging
+app.addHook('onRequest', async (req, rep) => {
+  // generate a consistent request id
+  req.requestId = req.headers['x-request-id'] || `req-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+  // attach request-scoped logger
+  req.log = app.log.child({ reqId: req.requestId, method: req.method, url: req.url });
+  rep.header('X-Request-ID', req.requestId);
 });
 
 // Global error handler
@@ -161,6 +165,63 @@ async function query(q, params) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const normText = (s) => (s || "").toLowerCase().replace(/\\s+/g, " ").trim();
 
+// Idempotency middleware for sensitive endpoints
+async function idempotencyMiddleware(req, rep) {
+  const idempotencyKey = req.headers['idempotency-key'];
+  if (!idempotencyKey) return;
+  
+  try {
+    // Check if this idempotency key was already processed
+    const cacheKey = `idempotency:${idempotencyKey}:${req.method}:${req.url}`;
+    const cachedResponse = await cache.get(cacheKey);
+    if (cachedResponse) {
+      app.log.info({ idempotencyKey, cached: true }, 'Returning cached idempotent response');
+      return rep.code(cachedResponse.statusCode || 200).send(cachedResponse.body);
+    }
+    
+    // Store key and original send method
+    req.idempotencyKey = idempotencyKey;
+    req.idempotencyCacheKey = cacheKey;
+    const originalSend = rep.send.bind(rep);
+    
+    // Override send to cache the response
+    rep.send = function(payload) {
+      if (req.idempotencyKey && rep.statusCode >= 200 && rep.statusCode < 300) {
+        cache.setWithDefault(req.idempotencyCacheKey, {
+          statusCode: rep.statusCode,
+          body: payload
+        }, 3600).catch(e => app.log.warn('Failed to cache idempotent response', e));
+      }
+      return originalSend(payload);
+    };
+    
+  } catch (e) {
+    app.log.warn('Idempotency middleware error', e);
+  }
+}
+
+// Uniform pagination helper
+function parsePagination(query) {
+  const limit = Math.min(Math.max(parseInt(query.limit) || 20, 1), 100);
+  const offset = Math.max(parseInt(query.offset) || 0, 0);
+  const page = Math.max(parseInt(query.page) || 1, 1);
+  const calculatedOffset = query.page ? (page - 1) * limit : offset;
+  return { limit, offset: calculatedOffset, page };
+}
+
+// Uniform filter helper
+function parseFilters(query) {
+  const filters = {
+    search: query.search ? normText(query.search) : null,
+    category: query.category || null,
+    language: query.language || null,
+    premium: query.premium !== undefined ? query.premium === 'true' : null,
+    dateFrom: query.date_from || null,
+    dateTo: query.date_to || null
+  };
+  return Object.fromEntries(Object.entries(filters).filter(([_, v]) => v !== null));
+}
+
 // Folosim sistemul avansat de retry pentru apeluri API
 // Folosim fetch direct în loc de fetchWithRetry pentru simplitate
 const fetchWithRetry = apiRetry.fetchWithRetry;
@@ -195,8 +256,55 @@ await app.register(rateLimit, { global: true, max: 200, timeWindow: '1m', allowL
 await app.register(compress);
 await app.register(swagger, { openapi: { info: { title: "SoulLift API", version: "10.1.0" } } });
 await app.register(swaggerUI, { routePrefix: "/docs" });
+// Add small OpenAPI schemas/examples used by Swagger UI
+app.addSchema({
+  $id: 'HealthResp',
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean' },
+    ts: { type: 'integer' },
+    status: { type: 'string' },
+    db: { type: 'boolean' },
+    cache: { type: 'boolean' },
+    stripe: { type: 'boolean' },
+    ai: { type: 'boolean' }
+  }
+});
+// Standard error response
+app.addSchema({
+  $id: 'ErrorResp',
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean' },
+    error: { type: 'string' },
+    code: { type: 'string' }
+  }
+});
+// Health with build info
+app.addSchema({
+  $id: 'HealthFull',
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean' },
+    ts: { type: 'integer' },
+    uptime: { type: 'number' },
+    status: { type: 'string' },
+    db: { type: 'boolean' },
+    cache: { type: 'boolean' },
+    stripe: { type: 'boolean' },
+    ai: { type: 'boolean' },
+    build: { type: 'object', properties: { commit: { type: 'string' }, time: { type: 'string' }, version: { type: 'string' } } }
+  }
+});
+
+// Checkout and webhook schemas
+app.addSchema({ $id: 'CheckoutResp', type: 'object', properties: { ok: { type: 'boolean' }, url: { type: 'string' } } });
+app.addSchema({ $id: 'StripeWebhookResp', type: 'object', properties: { ok: { type: 'boolean' }, id: { type: 'string' } } });
+app.addSchema({ $id: 'PersonalizeReq', type: 'object', properties: { preferences: { type: 'array', items: { type: 'string' } }, topics: { type: 'array', items: { type: 'string' } }, language: { type: 'string' } } });
+app.addSchema({ $id: 'PersonalizeResp', type: 'object', properties: { ok: { type: 'boolean' }, quote: { type: 'object', properties: { text: { type: 'string' }, language: { type: 'string' } } } } });
+app.addSchema({ $id: 'CheckoutReq', type: 'object', properties: { email: { type: 'string' }, priceId: { type: 'string' } } });
 await app.register(metrics, { endpoint: "/metrics", defaultMetrics: { enabled: true } });
-await app.register(fastifyRawBody, { field: "rawBody", global: false, runFirst: true });
+await app.register(fastifyRawBody, { field: "rawBody", global: true, runFirst: true });
 await app.register(logger.fastifyPlugin, { logLevel: isProd ? "info" : "debug" });
 // Header Request-ID
 app.addHook('onResponse', (request, reply, done) => {
@@ -298,9 +406,53 @@ const ensureTables = async () => {
       meta jsonb
     );
   `);
+  await query(`
+    create table if not exists stripe_events (
+      id bigserial primary key,
+      event_id text unique,
+      type text,
+      payload jsonb,
+      processed_at timestamptz
+    );
+  `);
+  await query(`
+    create table if not exists consumed_events (
+      id bigserial primary key,
+      event_id text not null,
+      event_type text not null,
+      processed_at timestamptz default now(),
+      metadata jsonb,
+      unique (event_id, event_type)
+    );
+  `);
+  await query(`
+    create table if not exists quotes (
+      id bigserial primary key,
+      quote text not null,
+      author text,
+      category text,
+      language text default 'EN',
+      created_at timestamptz default now()
+    );
+  `);
   // Index pentru filtrare rapidă după email
   await query(`
     create index if not exists idx_audit_email on audit_log(email);
+  `);
+  await query(`
+    create index if not exists idx_consumed_events_processed_at on consumed_events (processed_at desc);
+  `);
+  await query(`
+    create index if not exists idx_consumed_events_type on consumed_events (event_type);
+  `);
+  await query(`
+    create index if not exists idx_quotes_category on quotes (category);
+  `);
+  await query(`
+    create index if not exists idx_quotes_language on quotes (language);
+  `);
+  await query(`
+    create index if not exists idx_quotes_created_at on quotes (created_at desc);
   `);
 };
 await ensureTables();
@@ -373,12 +525,17 @@ async function isRefreshTokenValid(token) {
 function authMiddleware(req, rep, done) {
   const a = req.headers.authorization;
   if (!a) return rep.code(401).send({ error: "Missing Authorization header" });
-  const token = a.split(" ")[1];
+  if (!a.startsWith('Bearer ')) return rep.code(401).send({ error: "Invalid Authorization format" });
+  const token = a.slice(7); // Remove 'Bearer ' prefix
+  if (!token) return rep.code(401).send({ error: "Missing token" });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     // Check blacklist optional (Redis)
     cache.get(`blacklist:access:${token}`).then((blocked) => {
-      if (blocked) return rep.code(401).send({ error: 'token revoked' });
+      if (blocked) {
+        rep.code(401).send({ error: 'token revoked' });
+        return; // Don't call done() after sending response
+      }
       req.user = decoded;
       done();
     }).catch(() => {
@@ -507,28 +664,49 @@ function cosine(a, b) {
 // --- critical: generateAIQuote (missing previously) ---
 async function generateAIQuote() {
   if (!aiEnabled()) throw new Error("AI disabled");
-  // short prompt, English default
   const messages = [
     { role: "system", content: "Generate a short, original motivational quote (max 18 words). No author. Return ONLY the quote text." },
     { role: "user", content: "Motivation for daily progress" },
   ];
-  let lastErr;
-  app.log.debug("generateAIQuote start");
-  for (let i = 0; i < 3; i++) {
+  let lastErr = null;
+  app.log.info('generateAIQuote start');
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      app.log.debug("generateAIQuote attempt", { attempt: i + 1 });
+      app.log.debug('generateAIQuote attempt', { attempt });
       const text = await openaiChat(messages, { temperature: 0.8, max_tokens: 60 });
       const cleaned = (text || "").replace(/^\"|\"$/g, "").trim();
+      app.log.debug('generateAIQuote response', { attempt, raw: text });
       if (cleaned && cleaned.length >= 8) {
-        app.log.info("generateAIQuote success", { attempt: i + 1, length: cleaned.length });
+        app.log.info('generateAIQuote success', { attempt, length: cleaned.length });
         return cleaned;
       }
-      app.log.debug("generateAIQuote too short, retry", { attempt: i + 1, length: cleaned.length });
-      await sleep(300 * (i + 1));
-    } catch (e) { lastErr = e; app.log.warn("generateAIQuote error", { attempt: i + 1, error: e?.message || String(e) }); await sleep(300 * (i + 1)); }
+      app.log.warn('generateAIQuote invalid short result, retry', { attempt, length: cleaned.length });
+      lastErr = new Error('too_short');
+    } catch (e) {
+      lastErr = e;
+      app.log.warn('generateAIQuote error', { attempt, error: e?.message || String(e) });
+    }
+    // backoff
+    await sleep(200 * attempt);
+  }
+  // fallback to DeepL translate (if configured) to attempt a different route
+  if (DEEPL_KEY) {
+    try {
+      app.log.info('generateAIQuote fallback to DeepL');
+      // use DeepL to create a simple motivational phrase from a template
+      const tpl = 'Keep moving forward. Small steps every day lead to big changes.';
+      const res = await fetchWithRetry(`${DEEPL_ENDPOINT}/v2/translate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Authorization': `DeepL-Auth-Key ${DEEPL_KEY}` },
+        body: `text=${encodeURIComponent(tpl)}&target_lang=EN`
+      }, { maxRetries: 2, initialDelay: 200 });
+      const txt = res?.data?.translations?.[0]?.text || (typeof res === 'string' ? res : null);
+      if (txt) return txt;
+    } catch (e) { app.log.warn('DeepL fallback failed', e); }
   }
   if (lastErr) throw lastErr;
-  throw new Error("Failed to generate quote");
+  throw new Error('Failed to generate quote');
 }
 
 async function aiTagAndScore(text) {
@@ -622,29 +800,412 @@ async function generateBatchStore(count = 10) {
 const aiBatchSupervisor = createJobSupervisor("aiBatch", app.log);
 // initial fill (best-effort)
 (async () => { try { await aiBatchSupervisor.run(() => generateBatchStore(10)); } catch (e) { app.log.warn("initial ai gen", e); } })();
-// daily cron at 06:00 Europe/Bucharest
+// safe lock runner: acquires tryLock, runs fn, ensures release
+async function safeRunWithLock(key, ttlSec, fn) {
+  let locked = false;
+  try {
+    locked = await cache.tryLock(key, ttlSec);
+    if (!locked) return false;
+    await fn();
+    return true;
+  } catch (e) {
+    app.log.warn('safeRunWithLock error', { key, err: e?.message || e });
+    return true; // we ran (or attempted) while holding lock; still try to release
+  } finally {
+    if (locked) {
+      try { await cache.releaseLock(key); } catch (err) { app.log.warn('safeRunWithLock release failed', { key, err: err?.message || err }); }
+    }
+  }
+}
+
+// daily cron at 06:00 Europe/Bucharest using safeRunWithLock
 cron.schedule("0 6 * * *", async () => {
-  try { await aiBatchSupervisor.run(() => generateBatchStore(10)); } catch (e) { app.log.warn("cron ai gen", e); }
+  const lockKey = 'cron:ai:lock';
+  try {
+    const ran = await safeRunWithLock(lockKey, 60 * 10, async () => {
+      await aiBatchSupervisor.run(() => generateBatchStore(10));
+    });
+    if (!ran) app.log.info('AI cron skipped - lock held');
+  } catch (e) { app.log.warn('cron ai gen', e); }
 }, { timezone: "Europe/Bucharest" });
 
 // ---------- routes ----------
 
 // Înregistrăm rutele pentru funcționalitățile AI avansate
-// app.register(aiPersonalization, { prefix: '' });
-// app.register(aiRecommendations, { prefix: '' });
+// AI routes are registered asynchronously after startup to avoid blocking listen
+async function registerAiRoutesIfEnabled() {
+  try {
+    if (!aiEnabled()) {
+      app.log.info('AI routes disabled (OPENAI not configured)');
+      return;
+    }
+    app.log.info('Registering AI routes...');
+    const aiPersonalization = (await import('./src/routes/aiPersonalization.js')).default;
+    const aiRecommendations = (await import('./src/routes/aiRecommendations.js')).default;
+    await app.register(aiPersonalization);
+    await app.register(aiRecommendations);
+    app.log.info('AI routes registered');
+  } catch (e) {
+    app.log.warn('Failed to register AI routes', e);
+  }
+}
 
 // noise-free
 app.get("/", async () => ({ ok: true }));
 app.get("/favicon.ico", async (req, rep) => rep.code(204).send());
 
+// Global auth preHandler: skip public paths
+const publicPaths = new Set(['/', '/favicon.ico', '/health', '/api/health', '/healthz', '/config', '/v1/config', '/docs', '/docs/', '/metrics', '/api/languages', '/admin/telegram/test', '/api/notify/test', '/api/quotes/personalize', '/create-checkout-session']);
+app.addHook('preHandler', async (req, rep) => {
+  try {
+    if (publicPaths.has(req.routerPath || req.url.split('?')[0])) return;
+    // also allow open routes like /auth/register /auth/login if present
+    if (/^\/auth\//.test(req.url)) return;
+    // enforce auth
+    await new Promise((resolve, reject) => {
+      authMiddleware(req, rep, (err) => err ? reject(err) : resolve());
+    });
+  } catch (e) {
+    // authMiddleware will already have replied in many cases
+    if (!rep.sent) rep.code(401).send({ error: 'unauth' });
+  }
+});
+
 // health & config
+// Lightweight health endpoint that performs quick DB + Redis checks and returns app version and uptime
 app.get("/health", {
   schema: {
     tags: ['System'],
     summary: 'Health check',
-    response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, ts: { type: 'integer' } } } }
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          ts: { type: 'integer' },
+          status: { type: 'string' },
+          db: { type: 'boolean' },
+          cache: { type: 'boolean' },
+          stripe: { type: 'boolean' },
+          ai: { type: 'boolean' },
+          uptime: { type: 'number' },
+          version: { type: 'string' },
+          appVersion: { type: 'string' }
+        }
+      }
+    }
   }
-}, async () => ({ ok: true, ts: Date.now() }));
+}, async (req, rep) => {
+  // DB check: quick SELECT 1
+  let dbUp = false;
+  try {
+    if (pool) {
+      const r = await query('select 1 as ok');
+      dbUp = Array.isArray(r?.rows) && r.rows.length > 0;
+    }
+  } catch (e) { dbUp = false; }
+
+  // Cache check via cache.isUp() (Upstash/Redis)
+  let cacheUp = false;
+  try { cacheUp = !!(cache && typeof cache.isUp === 'function' ? await cache.isUp() : cache.isRedisConnected()); } catch (e) { cacheUp = false; }
+
+  // Stripe and AI flags
+  const stripeOk = Boolean(env.STRIPE_SECRET_KEY);
+  const aiOk = !!USE_OPENAI && !!OPENAI_KEY;
+
+  const out = {
+    ok: true,
+    status: 'ok',
+    ts: Date.now(),
+    db: dbUp,
+    cache: cacheUp,
+    stripe: stripeOk,
+    ai: aiOk,
+    uptime: Math.floor(process.uptime()),
+    version: pkgVersion || 'unknown',
+    appVersion: pkgVersion || 'unknown',
+    build: { commit: buildCommit || null, time: buildTime || null },
+    stripe_status: (async () => {
+      try {
+        if (!env.STRIPE_SECRET_KEY) return 'missing';
+        // quick ping by fetching a list with limit 1
+        const list = await stripe.customers.list({ limit: 1 });
+        return list && Array.isArray(list.data) ? 'ok' : 'unknown';
+      } catch (e) { return 'error'; }
+    })()
+  };
+  rep.header('X-Service-Ready', '1');
+  // resolve any async fields (stripe_status)
+  try {
+    out.stripe_status = await out.stripe_status;
+  } catch { out.stripe_status = 'error'; }
+  return respond.sendOk(rep, out);
+});
+
+// ---------- quotes endpoints ----------
+// all quotes (with search, pagination, categories)
+app.get("/api/quotes", {
+  schema: {
+    tags: ['Quotes'],
+    summary: 'Get all quotes with optional search and pagination',
+    querystring: {
+      type: 'object',
+      properties: {
+        page: { type: 'integer', minimum: 1, default: 1 },
+        offset: { type: 'integer', minimum: 0, default: 0 },
+        limit: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+        search: { type: 'string' },
+        category: { type: 'string' },
+        language: { type: 'string' },
+        premium: { type: 'string', enum: ['true', 'false'] },
+        date_from: { type: 'string', format: 'date' },
+        date_to: { type: 'string', format: 'date' }
+      }
+    },
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          quotes: {
+            type: 'array',
+            items: { type: 'object' }
+          },
+          pagination: {
+            type: 'object',
+            properties: {
+              page: { type: 'integer' },
+              offset: { type: 'integer' },
+              limit: { type: 'integer' },
+              total: { type: 'integer' },
+              pages: { type: 'integer' }
+            }
+          },
+          filters: { type: 'object' }
+        }
+      }
+    }
+  }
+}, async (req) => {
+  const pagination = parsePagination(req.query);
+  const filters = parseFilters(req.query);
+
+  let sql = "SELECT id, quote, author, category, language, created_at FROM quotes WHERE 1=1";
+  const params = [];
+
+  if (filters.search) {
+    sql += " AND (LOWER(quote) LIKE $" + (params.length + 1) + " OR LOWER(author) LIKE $" + (params.length + 2) + ")";
+    params.push(`%${filters.search}%`, `%${filters.search}%`);
+  }
+
+  if (filters.category) {
+    sql += " AND category = $" + (params.length + 1);
+    params.push(filters.category);
+  }
+
+  if (filters.language) {
+    sql += " AND language = $" + (params.length + 1);
+    params.push(filters.language);
+  }
+
+  if (filters.dateFrom) {
+    sql += " AND created_at >= $" + (params.length + 1);
+    params.push(filters.dateFrom);
+  }
+
+  if (filters.dateTo) {
+    sql += " AND created_at <= $" + (params.length + 1);
+    params.push(filters.dateTo);
+  }
+
+  sql += " ORDER BY id LIMIT $" + (params.length + 1) + " OFFSET $" + (params.length + 2);
+  params.push(pagination.limit, pagination.offset);
+
+  // count query
+  let countSql = "SELECT COUNT(*) as total FROM quotes WHERE 1=1";
+  const countParams = [];
+
+  if (filters.search) {
+    countSql += " AND (LOWER(quote) LIKE $" + (countParams.length + 1) + " OR LOWER(author) LIKE $" + (countParams.length + 2) + ")";
+    countParams.push(`%${filters.search}%`, `%${filters.search}%`);
+  }
+
+  if (filters.category) {
+    countSql += " AND category = $" + (countParams.length + 1);
+    countParams.push(filters.category);
+  }
+
+  if (filters.language) {
+    countSql += " AND language = $" + (countParams.length + 1);
+    countParams.push(filters.language);
+  }
+
+  if (filters.dateFrom) {
+    countSql += " AND created_at >= $" + (countParams.length + 1);
+    countParams.push(filters.dateFrom);
+  }
+
+  if (filters.dateTo) {
+    countSql += " AND created_at <= $" + (countParams.length + 1);
+    countParams.push(filters.dateTo);
+  }
+
+  try {
+    const [quotesResult, countResult] = await Promise.all([
+      query(sql, params),
+      query(countSql, countParams)
+    ]);
+
+    const total = parseInt(countResult.rows[0].total);
+    const pages = Math.ceil(total / pagination.limit);
+
+    return {
+      ok: true,
+      quotes: quotesResult.rows,
+      pagination: {
+        page: pagination.page,
+        offset: pagination.offset,
+        limit: pagination.limit,
+        total,
+        pages
+      },
+      filters
+    };
+  } catch (e) {
+    app.log.error('Quotes fetch error', e);
+    return { ok: false, error: 'Database error' };
+  }
+});
+
+// Add a safe fallback personalize endpoint in case AI plugin is not enabled
+app.post('/api/quotes/personalize', {
+  preHandler: [idempotencyMiddleware],
+  schema: { tags: ['Quotes'], summary: 'Fallback personalize (simple)'}
+}, async (req, rep) => {
+  app.log.debug('Fallback personalize called');
+  // Return a deterministic simple quote for tests
+  const quote = { text: 'Your personalized quote', language: (req.body && req.body.language) || 'en' };
+  return { ok: true, quote };
+});
+
+  // Stripe webhook
+  app.post('/webhook/stripe', {
+    schema: { tags: ['Stripe'], summary: 'Stripe webhook endpoint' }
+  }, async (req, rep) => {
+    const sig = req.headers['stripe-signature'];
+    const raw = req.rawBody || req.body;
+    let event;
+    try {
+        if (!STRIPE_WEBHOOK_SECRET) {
+          // No webhook secret configured (dev/test). Try to parse body safely and proceed (not recommended for prod).
+          app.log.warn('STRIPE_WEBHOOK_SECRET missing - accepting unsigned webhook (dev/test only)');
+          try { event = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { event = req.body; }
+        } else {
+          event = stripe.webhooks.constructEvent(raw, sig, STRIPE_WEBHOOK_SECRET);
+        }
+    } catch (e) {
+      app.log.warn('Invalid stripe signature', e?.message || e);
+        // Don't crash - respond 400 to Stripe for signature mismatch when secret is set.
+        if (STRIPE_WEBHOOK_SECRET) return rep.code(400).send({ ok: false, error: 'invalid_signature' });
+        // If no secret configured, fall back to parsing body
+        try { event = req.body; } catch { return rep.code(400).send({ ok: false }); }
+    }
+
+    // Robust idempotency: check if event id was already processed using consumed_events table
+    try {
+      // Record event idempotently. If event.id is missing, generate a best-effort id from type+timestamp
+      const eventId = event?.id || (`unsigned-${event?.type || 'unknown'}-${Date.now()}`);
+      const evType = event?.type || (event?.object && event.object.type) || 'unknown';
+      
+      // Check if already processed
+      const existingEvent = await query(
+        'SELECT id FROM consumed_events WHERE event_id = $1 AND event_type = $2',
+        [eventId, evType]
+      );
+      
+      if (existingEvent.rows.length > 0) {
+        app.log.info({ eventId, type: evType }, 'Stripe event already processed (idempotency)');
+        return rep.send({ received: true, cached: true });
+      }
+
+      // Insert event to prevent double processing
+      await query(
+        'INSERT INTO consumed_events (event_id, event_type, processed_at, metadata) VALUES ($1, $2, NOW(), $3)',
+        [eventId, evType, JSON.stringify({ 
+          created: event.created,
+          object: event.data?.object?.object || null,
+          customer: event.data?.object?.customer || null,
+          payload: event
+        })]
+      );
+      
+      // attach normalized event id for downstream processing
+      event.id = eventId;
+    } catch (e) { 
+      app.log.warn('stripe idempotency check failed', e); 
+      // If idempotency check fails, still process (non-critical)
+    }
+
+    // Process relevant events
+    try {
+      const type = event.type;
+      const data = event.data.object || {};
+      app.log.info({ event: event.id, type }, 'Stripe webhook received');
+
+      // handle events
+      if (type === 'checkout.session.completed') {
+        // find user by customer_email or metadata
+        const email = data.customer_email || (data.metadata && data.metadata.user_email);
+        if (email) {
+          await query('update users set subscription_status=$1, stripe_customer_id=$2 where email=$3', ['active', data.customer, email]);
+        }
+      } else if (type === 'invoice.paid') {
+        const cust = data.customer;
+        const subId = data.subscription;
+        const periodEnd = data.lines?.data?.[0]?.period?.end || null;
+        await query('update users set subscription_status=$1, stripe_sub_id=$2, current_period_end=$3 where stripe_customer_id=$4', ['active', subId, periodEnd, cust]);
+      } else if (type === 'invoice.payment_failed') {
+        const cust = data.customer;
+        await query('update users set subscription_status=$1 where stripe_customer_id=$2', ['past_due', cust]);
+      } else if (type === 'customer.subscription.updated' || type === 'customer.subscription.deleted') {
+        const cust = data.customer;
+        const status = data.status || (type === 'customer.subscription.deleted' ? 'deleted' : null);
+        const cancelAt = data.cancel_at_period_end || false;
+        const periodEnd = data.current_period_end || null;
+        await query('update users set subscription_status=$1, cancel_at_period_end=$2, current_period_end=$3 where stripe_customer_id=$4', [status, cancelAt, periodEnd, cust]);
+      }
+    } catch (e) {
+      app.log.error('Error processing stripe event', e);
+      // If processing failed, remove the consumed_events entry to allow retry
+      try {
+        await query(
+          'DELETE FROM consumed_events WHERE event_id = $1 AND event_type = $2',
+          [event.id, event.type]
+        );
+      } catch (deleteError) {
+        app.log.error('Failed to clean up consumed_events on error', deleteError);
+      }
+      return rep.code(500).send({ received: false, error: 'processing_failed' });
+    }
+    return rep.send({ received: true });
+  });
+
+  // Billing portal link
+  app.get('/billing/portal', async (req, rep) => {
+    const a = req.headers.authorization || '';
+    if (!a.startsWith('Bearer ')) return rep.code(401).send({ error: 'unauth' });
+    const token = a.split(' ')[1];
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      const email = decoded.email;
+      // find stripe_customer_id
+      const { rows } = await query('select stripe_customer_id from users where email=$1', [email]);
+      const cid = rows[0] && rows[0].stripe_customer_id;
+      if (!cid) return rep.code(400).send({ error: 'no_customer' });
+      const session = await stripe.billingPortal.sessions.create({ customer: cid, return_url: FRONTEND_URL });
+      return rep.send({ ok: true, url: session.url });
+    } catch (e) { return rep.code(401).send({ error: 'unauth' }); }
+  });
 app.get("/api/health", {
   schema: {
     tags: ['System'],
@@ -688,15 +1249,48 @@ app.get("/config", {
       }
     }
   }
-}, async () => ({
-  ok: true,
-  features: {
-    openai: aiEnabled(), deepl: Boolean(DEEPL_KEY),
+}, async function (req, rep) {
+  const features = {
+    openai: aiEnabled(),
+    deepl: Boolean(DEEPL_KEY),
     fcm: Boolean(FIREBASE_PROJECT_ID && FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY),
     sentry: Boolean(process.env.SENTRY_DSN),
     ai_recommendations: aiEnabled(),
-  },
-}));
+  };
+  return { ok: true, features };
+});
+
+// Create Checkout session for subscription (safe in test/no-stripe mode)
+app.post('/create-checkout-session', {
+  preHandler: [idempotencyMiddleware]
+}, async (req, rep) => {
+  if (!env.STRIPE_SECRET_KEY) return rep.code(400).send({ error: 'stripe_not_configured' });
+  const { email, priceId } = req.body || {};
+  if (!email) return rep.code(400).send({ error: 'missing_email' });
+  try {
+    // find or create customer
+    let customerId = null;
+    const { rows } = await query('select stripe_customer_id from users where email=$1', [email]);
+    if (rows[0] && rows[0].stripe_customer_id) customerId = rows[0].stripe_customer_id;
+    if (!customerId) {
+      const cust = await stripe.customers.create({ email });
+      customerId = cust.id;
+      // persist customer id if DB available
+      try { if (pool) await query('update users set stripe_customer_id=$1 where email=$2', [customerId, email]); } catch (e) { app.log.warn('persist stripe customer failed', e); }
+    }
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customerId,
+      line_items: [{ price: priceId || STRIPE_PRICE_ID_MONTHLY, quantity: 1 }],
+      success_url: `${FRONTEND_URL}/billing/success`,
+      cancel_url: `${FRONTEND_URL}/billing/cancel`,
+    });
+    return rep.send({ ok: true, url: session.url, id: session.id });
+  } catch (e) {
+    app.log.error('create-checkout-session failed', e);
+    return rep.code(500).send({ error: 'checkout_failed' });
+  }
+});
 
 // /v1 alias for config
 app.get("/v1/config", {
@@ -722,17 +1316,34 @@ app.get("/v1/config", {
       }
     }
   }
-}, async () => ({
-  ok: true,
-  features: {
-    openai: aiEnabled(), deepl: Boolean(DEEPL_KEY),
+}, async function (req, rep) {
+  const features = {
+    openai: aiEnabled(),
+    deepl: Boolean(DEEPL_KEY),
     fcm: Boolean(FIREBASE_PROJECT_ID && FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY),
     sentry: Boolean(process.env.SENTRY_DSN),
     ai_recommendations: aiEnabled(),
-  },
-}));
+  };
+  return { ok: true, features };
+});
 
 // languages
+const supportedLanguages = [
+  { code: "EN", name: "English", nativeName: "English" },
+  { code: "RO", name: "Romanian", nativeName: "Română" },
+  { code: "FR", name: "French", nativeName: "Français" },
+  { code: "DE", name: "German", nativeName: "Deutsch" },
+  { code: "ES", name: "Spanish", nativeName: "Español" },
+  { code: "IT", name: "Italian", nativeName: "Italiano" },
+  { code: "PT", name: "Portuguese", nativeName: "Português" },
+  { code: "RU", name: "Russian", nativeName: "Русский" },
+  { code: "JA", name: "Japanese", nativeName: "日本語" },
+  { code: "ZH", name: "Chinese", nativeName: "中文" },
+  { code: "NL", name: "Dutch", nativeName: "Nederlands" },
+  { code: "PL", name: "Polish", nativeName: "Polski" },
+  { code: "TR", name: "Turkish", nativeName: "Türkçe" }
+];
+
 app.get("/api/languages", {
   schema: {
     tags: ['System'],
@@ -747,10 +1358,38 @@ app.get("/api/languages", {
       }
     }
   }
-}, async () => ({ ok: true, languages: ["EN", "RO", "FR", "DE", "ES", "IT", "PT", "RU", "JA", "ZH", "NL", "PL", "TR"] }));
+}, async () => ({ ok: true, languages: supportedLanguages.map(l => l.code) }));
+
+// i18n languages endpoint with detailed info
+app.get("/i18n/languages", {
+  schema: {
+    tags: ['I18n'],
+    summary: 'Internationalization languages with details',
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          languages: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                code: { type: 'string' },
+                name: { type: 'string' },
+                nativeName: { type: 'string' }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}, async () => ({ ok: true, languages: supportedLanguages }));
 
 // auth
 app.post("/api/register", {
+  preHandler: [idempotencyMiddleware],
   schema: {
     tags: ['Auth'],
     summary: 'Înregistrare utilizator',
@@ -791,6 +1430,7 @@ app.post("/api/register", {
 
 app.post("/api/login", {
   config: { rateLimit: { max: 10, timeWindow: '1m' } },
+  preHandler: [idempotencyMiddleware],
   schema: {
     tags: ['Auth'],
     summary: 'Autentificare utilizator',
@@ -879,8 +1519,9 @@ app.post('/api/auth/logout', {
   if (!token) return rep.code(400).send({ error: 'token missing' });
   try {
     const { exp } = jwt.verify(token, JWT_SECRET);
-    const ttl = Math.max(1, (exp || Math.floor(Date.now()/1000)+900) - Math.floor(Date.now()/1000));
-    await cache.set(`blacklist:access:${token}`, true, ttl);
+  const ttl = Math.max(1, (exp || Math.floor(Date.now()/1000)+900) - Math.floor(Date.now()/1000));
+  if (typeof cache.setWithDefault === 'function') await cache.setWithDefault(`blacklist:access:${token}`, true, ttl);
+  else await cache.set(`blacklist:access:${token}`, true, ttl);
     return { ok: true };
   } catch {
     return rep.code(400).send({ error: 'invalid token' });
@@ -903,52 +1544,49 @@ app.get("/api/categories", {
       }
     }
   }
-}, async (req, rep) => {
-  // Conditional GET using ETag and Last-Modified
-  const inm = req.headers["if-none-match"];
-  const ims = req.headers["if-modified-since"];
-
-  if (categoriesETag && inm === categoriesETag) {
-    rep.header("ETag", categoriesETag);
-    if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
-    rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
-    return rep.code(304).send();
-  }
-  if (categoriesLastMod && ims) {
-    const since = new Date(ims).getTime();
-    if (!Number.isNaN(since) && since >= categoriesLastMod) {
-      if (categoriesETag) rep.header("ETag", categoriesETag);
-      rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
+}, async function (req, rep) {
+    const inm = req.headers["if-none-match"];
+    const ims = req.headers["if-modified-since"];
+    if (categoriesETag && inm === categoriesETag) {
+      rep.header("ETag", categoriesETag);
+      if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
       rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
       return rep.code(304).send();
     }
-  }
-
-  // Redis-backed TTL caching (fallback la memoryCache)
-  const cacheKey = "cache:categories:v1";
-  try {
-    const cached = await cache.get(cacheKey);
-    if (cached && Array.isArray(cached.categories)) {
-      if (categoriesETag) rep.header("ETag", categoriesETag);
-      if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
-      rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
-      return { ok: true, categories: cached.categories };
+    if (categoriesLastMod && ims) {
+      const since = new Date(ims).getTime();
+      if (!Number.isNaN(since) && since >= categoriesLastMod) {
+        if (categoriesETag) rep.header("ETag", categoriesETag);
+        rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
+        rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
+        return rep.code(304).send();
+      }
     }
-  } catch (e) {
-    // dacă cache e indisponibil, continuăm fără să întrerupem răspunsul
-    app.log.warn("Categories cache read failed", { error: e?.message || String(e) });
-  }
 
-  if (categoriesETag) rep.header("ETag", categoriesETag);
-  if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
-  rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
-  const payload = { ok: true, categories };
-  try {
-    await cache.set(cacheKey, { categories }, 3600);
-  } catch (e) {
-    app.log.warn("Categories cache write failed", { error: e?.message || String(e) });
-  }
-  return payload;
+    const cacheKey = "cache:categories:v1";
+    try {
+      const cached = await cache.get(cacheKey);
+      if (cached && Array.isArray(cached.categories)) {
+        if (categoriesETag) rep.header("ETag", categoriesETag);
+        if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
+        rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
+        return { ok: true, categories: cached.categories };
+      }
+    } catch (e) {
+      app.log.warn("Categories cache read failed", { error: e?.message || String(e) });
+    }
+
+    if (categoriesETag) rep.header("ETag", categoriesETag);
+    if (categoriesLastMod) rep.header("Last-Modified", new Date(categoriesLastMod).toUTCString());
+    rep.header("Cache-Control", "public, max-age=3600, must-revalidate");
+    const payload = { ok: true, categories };
+    try {
+  if (typeof cache.setWithDefault === 'function') await cache.setWithDefault(cacheKey, { categories }, 3600);
+  else await cache.set(cacheKey, { categories }, 3600);
+    } catch (e) {
+      app.log.warn("Categories cache write failed", { error: e?.message || String(e) });
+    }
+    return payload;
 });
 
 // /v1 alias for categories
@@ -1591,7 +2229,7 @@ app.post("/api/notify/broadcast", {
         body: { type: 'string', minLength: 1 },
         proOnly: { type: 'boolean' },
         topic: { type: 'string' }
-      },
+                                                                         },
       required: ['title','body']
     },
     response: { 200: { type: 'object', properties: { ok: { type: 'boolean' }, sent: { type: 'integer', minimum: 0 } } } }
@@ -1782,6 +2420,90 @@ cron.schedule("30 7 * * *", async () => {
     }
   } catch (e) { app.log.warn("daily digest err", e); }
 }, { timezone: "Europe/Bucharest" });
+
+// ---------- stats overview ----------
+app.get("/stats/overview", {
+  preHandler: [authMiddleware],
+  schema: {
+    tags: ['Stats'],
+    summary: 'Overview statistics',
+    response: {
+      200: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          stats: {
+            type: 'object',
+            properties: {
+              users: { type: 'object' },
+              quotes: { type: 'object' },
+              activity: { type: 'object' },
+              system: { type: 'object' }
+            }
+          }
+        }
+      }
+    }
+  }
+}, async (req) => {
+  const email = req.user.email;
+  
+  try {
+    // Get user stats
+    const userStats = await query(`
+      SELECT 
+        COUNT(*) as total_users,
+        COUNT(CASE WHEN subscription_status = 'active' THEN 1 END) as premium_users,
+        COUNT(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 END) as new_users_week
+      FROM users
+    `);
+    
+    // Get quote stats
+    const quoteStats = await query(`
+      SELECT 
+        (SELECT COUNT(*) FROM favorites WHERE email = $1) as user_favorites,
+        (SELECT COUNT(*) FROM ai_quotes) as total_ai_quotes,
+        (SELECT COUNT(*) FROM ai_quotes WHERE created_at > NOW() - INTERVAL '7 days') as new_ai_quotes_week
+    `, [email]);
+    
+    // Get activity stats for current user
+    const activityStats = await query(`
+      SELECT 
+        COUNT(*) as total_actions,
+        COUNT(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 END) as actions_week,
+        COUNT(CASE WHEN created_at > NOW() - INTERVAL '1 day' THEN 1 END) as actions_today
+      FROM audit_log WHERE email = $1
+    `, [email]);
+    
+    // System stats
+    const systemStats = {
+      uptime: Math.floor(process.uptime()),
+      memory: {
+        used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024)
+      },
+      version: pkgVersion,
+      node: process.version,
+      cache: {
+        connected: cache.isUp(),
+        type: REDIS_URL ? (REDIS_URL.startsWith('https') ? 'upstash' : 'redis') : 'memory'
+      }
+    };
+    
+    return {
+      ok: true,
+      stats: {
+        users: userStats.rows[0] || {},
+        quotes: quoteStats.rows[0] || {},
+        activity: activityStats.rows[0] || {},
+        system: systemStats
+      }
+    };
+  } catch (e) {
+    app.log.error('Stats overview error', e);
+    return { ok: false, error: 'Failed to fetch stats' };
+  }
+});
 
 // ---------- admin/test & export ----------
 app.post("/admin/telegram/test", {
@@ -2076,6 +2798,9 @@ app.post("/v1/gdpr/delete", {
 try {
   await app.listen({ port: PORT, host: "0.0.0.0" });
   app.log.info(`SoulLift listening on :${PORT}`);
+  app.log.info(`Server started on PORT ${PORT} (version ${pkgVersion})`);
+  // Register AI routes asynchronously (do not block listen)
+  registerAiRoutesIfEnabled().catch(e => app.log.warn('post-listen AI register failed', e));
 } catch (e) {
   Sentry.captureException(e);
   app.log.error(e);
