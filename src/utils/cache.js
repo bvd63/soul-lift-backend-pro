@@ -34,7 +34,16 @@ async function initRedis(redisUrl) {
 
   try {
     const { createClient } = await import('redis');
-    redisClient = createClient({ url: redisUrl });
+    // Suport Redis Enterprise Cloud: username/parolă și TLS
+    const isSecure = /^rediss:\/\//.test(redisUrl) || String(process.env.REDIS_TLS || '').toLowerCase() === 'true';
+    const username = process.env.REDIS_USERNAME || undefined;
+    const password = process.env.REDIS_PASSWORD || undefined;
+    const clientOpts = { url: redisUrl };
+    if (username) clientOpts.username = username;
+    if (password) clientOpts.password = password;
+    if (isSecure) clientOpts.socket = { tls: true };
+
+    redisClient = createClient(clientOpts);
     redisClient.on('error', (err) => {
       redisReady = false;
       console.error('Redis error:', err?.message || err);
