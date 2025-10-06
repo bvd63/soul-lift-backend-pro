@@ -173,7 +173,8 @@ async function fetchWithRetry(url, options = {}, retryConfig = {}) {
       if (config.cacheSuccessfulResponses && response.ok) {
         const cacheKey = `api-${options.method || 'GET'}-${url}-${JSON.stringify(options.body || {})}`;
         const ttlSec = Math.max(1, Math.floor((config.cacheTTL || 60000) / 1000));
-        await cache.set(cacheKey, responseData, ttlSec);
+        if (typeof cache.setWithDefault === 'function') await cache.setWithDefault(cacheKey, responseData, ttlSec);
+        else await cache.set(cacheKey, responseData, ttlSec);
       }
       
       // Opțional returnăm metadate (status, ok, headers) pentru logging detaliat
