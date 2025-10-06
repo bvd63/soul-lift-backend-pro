@@ -4,6 +4,7 @@
 import validator from '../utils/validator.js';
 import apiRetry from '../utils/apiRetry.js';
 import redisClient from '../services/redisClient.js';
+import fs from 'fs';
 
 /**
  * Înregistrează rutele pentru personalizarea citatelor cu AI
@@ -124,8 +125,18 @@ Răspunde doar cu citatul generat, fără ghilimele sau alte explicații.`;
         logRetries: true
       });
 
+      const logFile = './logs/openai_debug.log';
+      const logMessage = `\nPrompt trimis către OpenAI: ${prompt}\nRăspuns complet OpenAI: ${JSON.stringify(openaiResponse, null, 2)}\n`;
+      fs.appendFileSync(logFile, logMessage);
+      if (!openaiResponse || !openaiResponse.choices || !openaiResponse.choices[0]) {
+        fs.appendFileSync(logFile, `Răspuns OpenAI invalid sau gol: ${JSON.stringify(openaiResponse, null, 2)}\n`);
+      } else {
+        fs.appendFileSync(logFile, `Citat generat: ${openaiResponse.choices[0].message.content.trim()}\n`);
+      }
+      
       // Extragem citatul generat
       const generatedQuote = openaiResponse.choices[0].message.content.trim();
+      console.log('Citat generat:', generatedQuote);
 
       // Salvăm citatul în baza de date
       const insertResult = await db.query(
