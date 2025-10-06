@@ -3,7 +3,7 @@
 
 import validator from '../utils/validator.js';
 import apiRetry from '../utils/apiRetry.js';
-import memoryCache from '../utils/memoryCache.js';
+import redisClient from '../services/redisClient.js';
 
 /**
  * Înregistrează rutele pentru sistemul de recomandări bazat pe AI
@@ -25,7 +25,7 @@ export default async function (fastify, options) {
       
       // Verificăm cache-ul pentru a evita generări redundante
       const cacheKey = `recommendations-${userId}-${count}`;
-      const cachedResponse = memoryCache.get(cacheKey);
+      const cachedResponse = await redisClient.get(cacheKey);
       
       if (cachedResponse) {
         logger.info('Recomandări obținute din cache', { requestId, userId });
@@ -188,8 +188,8 @@ Răspunde cu numerele citatelor recomandate (din lista de citate disponibile) ș
         recommendations: recommendations
       };
 
-      // Salvăm în cache pentru utilizări viitoare (15 minute)
-      memoryCache.set(cacheKey, response, 15 * 60 * 1000);
+      // Salvăm în cache în Redis pentru utilizări viitoare (15 minute)
+      await redisClient.set(cacheKey, response, 15 * 60);
 
       return response;
     } catch (error) {
