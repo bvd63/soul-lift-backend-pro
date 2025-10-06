@@ -15,7 +15,7 @@ services:
     startCommand: "node index.js"
 
     # Se potrivește cu rutele din index.js (există și /healthz ca alias)
-    healthCheckPath: /health
+      healthCheckPath: /api/health
     healthCheckTimeout: 100
 
     envVars:
