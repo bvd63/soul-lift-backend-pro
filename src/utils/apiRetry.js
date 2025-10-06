@@ -14,7 +14,7 @@
 
 // Importuri necesare
 import fetch from 'node-fetch';
-import memoryCache from './memoryCache.js';
+import redisClient from '../services/redisClient.js';
 
 // Configurare implicită
 const DEFAULT_CONFIG = {
@@ -53,7 +53,7 @@ async function fetchWithRetry(url, options = {}, retryConfig = {}) {
   // Verificăm cache-ul dacă este activat
   if (config.cacheSuccessfulResponses) {
     const cacheKey = `api-${options.method || 'GET'}-${url}-${JSON.stringify(options.body || {})}`;
-    const cachedResponse = memoryCache.get(cacheKey);
+    const cachedResponse = await redisClient.get(cacheKey);
     if (cachedResponse) {
       console.log(`[ApiRetry] Cache hit for ${options.method || 'GET'} ${url}`);
       return cachedResponse;
@@ -172,7 +172,8 @@ async function fetchWithRetry(url, options = {}, retryConfig = {}) {
       // Adăugăm în cache dacă este activat
       if (config.cacheSuccessfulResponses && response.ok) {
         const cacheKey = `api-${options.method || 'GET'}-${url}-${JSON.stringify(options.body || {})}`;
-        memoryCache.set(cacheKey, responseData, config.cacheTTL);
+        const ttlSec = Math.max(1, Math.floor((config.cacheTTL || 60000) / 1000));
+        await redisClient.set(cacheKey, responseData, ttlSec);
       }
       
       // Opțional returnăm metadate (status, ok, headers) pentru logging detaliat
