@@ -5,6 +5,8 @@ envVarGroups:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_NO_WARNINGS
+        value: "1"
       - key: CORS_ORIGINS
         value: "http://localhost:5173"
       - key: USE_OPENAI
