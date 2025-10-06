@@ -175,6 +175,10 @@ async function fetchWithRetry(url, options = {}, retryConfig = {}) {
         memoryCache.set(cacheKey, responseData, config.cacheTTL);
       }
       
+      // Opțional returnăm metadate (status, ok, headers) pentru logging detaliat
+      if (config.returnMeta) {
+        return { ok: response.ok, status: response.status, headers: Object.fromEntries(response.headers), data: responseData };
+      }
       return responseData;
     } catch (error) {
       clearTimeout(timeoutId);
