@@ -71,3 +71,19 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+
+      # Redis Enterprise Cloud (Managed)
+      - key: REDIS_URL
+        sync: false
+      - key: REDIS_USERNAME
+        value: default
+      - key: REDIS_PASSWORD
+        sync: false
+      - key: REDIS_TLS
+        value: true
+
+      # Upstash Redis REST (alternativ, nu seta REDIS_URL dacă folosești asta)
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
