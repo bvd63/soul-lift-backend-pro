@@ -534,7 +534,25 @@ async function initDB(query) {
 async function start() {
   try {
     const app = await createApp();
-    await initDB();
+    
+    // Initialize database with proper query function
+    let query = mockQuery;
+    if (USE_DB) {
+      try {
+        const postgresModule = await import('postgres');
+        const postgres = postgresModule.default;
+        query = postgres(env.DATABASE_URL, {
+          idle_timeout: 20,
+          max_lifetime: 60 * 30
+        });
+        console.log('✅ Database connection established');
+      } catch (e) {
+        console.log('⚠️ postgres not available');
+        query = mockQuery;
+      }
+    }
+    
+    await initDB(query);
     
     const address = await app.listen({ 
       port: env.PORT, 
