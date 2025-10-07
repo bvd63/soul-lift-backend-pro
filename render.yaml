@@ -34,7 +34,7 @@ services:
       - soullift-common
 
     buildCommand: "npm ci"
-    startCommand: "node index.js"
+    startCommand: "node src/index.js"
 
     # Se potrivește cu rutele din index.js (există și /healthz ca alias)
     healthCheckPath: /api/health
@@ -47,7 +47,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: PORT
-        value: 3000
+        value: 10000
       - key: APP_BASE_URL
         value: "https://soullift-backend.onrender.com"   # ajustează după ce ai domeniu
       - key: FRONTEND_URL
