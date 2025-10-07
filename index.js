@@ -1,53 +1,33 @@
-// SoulLift Backend - Optimized Version for Render
-// Comprehensive mindfulness & quotes platform with AI voices and social features
-
+// SoulLift Backend - Clean Production Version
 import Fastify from 'fastify';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import { readFileSync, existsSync } from 'fs';
-import { cleanEnv, str, num, bool } from 'envalid';
+import { assertDbConnection } from './src/db.js';
+import QUOTES from './data/quotes.js';
+import { cleanEnv, str, port, bool, url } from 'envalid';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-// Inline quotes for simplicity
-const QUOTES = [
-  { id: "q1", text: "Your future is created by what you do today, not tomorrow.", author: "Robert Kiyosaki", source: "Interview", year: 2001, premium: false },
-  { id: "q2", text: "Success is not for the lazy.", author: "Jim Rohn", source: "Seminar", year: 1985, premium: false },
-  { id: "q3", text: "Focus on progress, not perfection.", author: "Bill Gates", source: "Talk", year: 2010, premium: false },
-  { id: "q4", text: "Gratitude turns what we have into enough.", author: "Aesop", source: "Fables", year: -550, premium: true },
-];
-
-const PREMIUM_COLLECTIONS = [
-  { id: "stoicism", name: "Stoicism Starter", items: ["q4"] },
-  { id: "deep-focus", name: "Deep Focus", items: ["q2", "q3"] },
-];
-
-// Environment validation
 const env = cleanEnv(process.env, {
-  PORT: num({ default: 3000 }),
   NODE_ENV: str({ default: 'development' }),
-  DATABASE_URL: str({ default: '' }),
-  JWT_SECRET: str({ default: 'dev-secret-key' }),
-  FRONTEND_URL: str({ default: 'http://localhost:3000' }),
+  PORT: port({ default: 10000 }),
+  DATABASE_URL: str(),
+  FRONTEND_URL: url({ default: 'http://localhost:3000' }),
   OPENAI_API_KEY: str({ default: '' }),
   STRIPE_SECRET_KEY: str({ default: '' }),
-  STRIPE_WEBHOOK_SECRET: str({ default: '' }),
   STRIPE_PRICE_ID_STANDARD_MONTHLY: str({ default: '' }),
-  STRIPE_PRICE_ID_PRO_MONTHLY: str({ default: '' }),
-  STRIPE_PRICE_ID_MONTHLY: str({ default: '' }), // legacy
-  REDIS_URL: str({ default: '' }),
-  DEEPL_API_KEY: str({ default: '' }),
-  TELEGRAM_BOT_TOKEN: str({ default: '' }),
-  TELEGRAM_CHAT_ID: str({ default: '' })
+  STRIPE_PRICE_ID_PRO_MONTHLY: str({ default: '' })
 });
 
-// Configuration
 const USE_DB = !!env.DATABASE_URL;
 const USE_OPENAI = !!env.OPENAI_API_KEY;
 const USE_STRIPE = !!env.STRIPE_SECRET_KEY;
 
-// Voice Service (inline for simplicity)
+console.log('🔧 Environment:', {
+  NODE_ENV: env.NODE_ENV,
+  PORT: env.PORT,
+  USE_DB,
+  USE_OPENAI,
+  USE_STRIPE
+});
+
+// Voice profiles for AI selection
 const voiceProfiles = {
   feminine: {
     motivational: ['maria_energetic', 'maya_powerful', 'nova_dynamic'],
@@ -73,6 +53,7 @@ const voiceMapping = {
   'zane_powerful': 'echo', 'ace_gentle': 'fable'
 };
 
+// Voice service functions
 function getVoiceDescription(voice) {
   const descriptions = {
     'sophia_calm': 'Calm and nurturing feminine voice',
@@ -135,7 +116,7 @@ async function generateHumanVoiceAudio(text, voice, tier, speed = 1.0, format = 
   }
 }
 
-// Utility to retry API calls
+// Utility functions
 async function fetchWithRetry(url, options, retryOptions = {}) {
   const { maxRetries = 3, initialDelay = 300 } = retryOptions;
   let lastError;
@@ -153,12 +134,6 @@ async function fetchWithRetry(url, options, retryOptions = {}) {
     }
   }
   throw lastError;
-}
-
-// Mock query for development
-async function mockQuery() {
-  console.log('📋 Mock database query (no real DB)');
-  return { rows: [] };
 }
 
 async function openaiChat(messages, opts = {}) {
@@ -198,21 +173,29 @@ async function pushAudit(action, email, meta = {}) {
   console.log('📝 Audit:', { action, email, meta });
 }
 
+// Database retry function
+async function waitForDb(maxAttempts = 15, delay = 1500) {
+  for (let i = 1; i <= maxAttempts; i++) {
+    try {
+      await assertDbConnection();
+      console.log(`✅ Database connected on attempt ${i}`);
+      return true;
+    } catch (error) {
+      console.log(`🔄 Database attempt ${i}/${maxAttempts} failed: ${error.message}`);
+      if (i === maxAttempts) {
+        throw new Error(`Failed to connect to database after ${maxAttempts} attempts`);
+      }
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
+
 // Main application function
 async function createApp() {
   const app = Fastify({ logger: env.NODE_ENV === 'development' });
 
   // Dynamic imports for optional dependencies
-  let postgres, Stripe, query, stripe;
-  
-  try {
-    const postgresModule = await import('postgres');
-    postgres = postgresModule.default;
-    query = USE_DB ? postgres(env.DATABASE_URL) : mockQuery;
-  } catch (e) {
-    console.log('⚠️ postgres not available');
-    query = mockQuery;
-  }
+  let Stripe, stripe;
 
   try {
     const stripeModule = await import('stripe');
@@ -230,8 +213,19 @@ async function createApp() {
   });
 
   // Health endpoints
-  app.get('/health', async () => ({ ok: true, version: '1.0.8', timestamp: Date.now() }));
-  app.get('/api/health', async () => ({ ok: true, db: USE_DB, ai: USE_OPENAI, stripe: USE_STRIPE }));
+  app.get('/health', async () => ({ ok: true, version: '1.0.9', timestamp: Date.now() }));
+  
+  app.get('/healthz', async (req, reply) => {
+    try {
+      await assertDbConnection();
+      return { status: 'ok', db: true };
+    } catch (error) {
+      reply.code(503);
+      return { status: 'error', db: false, error: error.message };
+    }
+  });
+  
+  app.get('/api/health', async () => ({ ok: true, db: true, ai: USE_OPENAI, stripe: USE_STRIPE }));
 
   // Get daily quote
   app.get('/api/quote', {
@@ -485,7 +479,7 @@ async function createApp() {
       info: {
         title: 'SoulLift API',
         description: 'Mindfulness & quotes platform with AI voices',
-        version: '1.0.8'
+        version: '1.0.9'
       }
     }
   });
@@ -498,61 +492,37 @@ async function createApp() {
 }
 
 // Database initialization
-async function initDB(query) {
-  if (!USE_DB || query === mockQuery) {
-    console.log('📋 Running in test mode without database');
+async function initDB() {
+  if (!USE_DB) {
+    console.log('📋 Running without database');
     return;
   }
   
   try {
-    await query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        subscription_tier VARCHAR(50) DEFAULT 'free',
-        subscription_status VARCHAR(50) DEFAULT 'inactive',
-        stripe_customer_id VARCHAR(255),
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-      
-      CREATE TABLE IF NOT EXISTS audit_log (
-        id SERIAL PRIMARY KEY,
-        action VARCHAR(100) NOT NULL,
-        email VARCHAR(255),
-        meta JSONB DEFAULT '{}',
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-    
-    console.log('✅ Database initialized successfully');
+    // Basic health check - more detailed schema setup can be added here
+    await assertDbConnection();
+    console.log('✅ Database ready');
   } catch (e) {
-    console.error('❌ Database initialization failed:', e.message);
+    console.error('❌ Database init failed:', e.message);
+    throw e;
   }
 }
 
 // Startup
 async function start() {
   try {
-    const app = await createApp();
+    console.log('🚀 Starting SoulLift Backend...');
     
-    // Initialize database with proper query function
-    let query = mockQuery;
+    // Wait for database connection with retry logic
     if (USE_DB) {
-      try {
-        const postgresModule = await import('postgres');
-        const postgres = postgresModule.default;
-        query = postgres(env.DATABASE_URL, {
-          idle_timeout: 20,
-          max_lifetime: 60 * 30
-        });
-        console.log('✅ Database connection established');
-      } catch (e) {
-        console.log('⚠️ postgres not available');
-        query = mockQuery;
-      }
+      await waitForDb();
     }
     
-    await initDB(query);
+    // Initialize database
+    await initDB();
+    
+    // Create and start the app
+    const app = await createApp();
     
     const address = await app.listen({ 
       port: env.PORT, 
@@ -565,7 +535,7 @@ async function start() {
     console.log(`💳 Payments: ${USE_STRIPE ? 'Enabled' : 'Disabled'}`);
     console.log(`🗄️ Database: ${USE_DB ? 'Connected' : 'Mock Mode'}`);
   } catch (err) {
-    console.error(err);
+    console.error('💥 Failed to start server:', err);
     process.exit(1);
   }
 }
